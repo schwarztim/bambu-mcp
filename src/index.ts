@@ -1,0 +1,981 @@
+#!/usr/bin/env node
+/**
+ * Bambu Lab MCP Server
+ *
+ * Complete MCP server for Bambu Lab 3D printers featuring:
+ * - Local MQTT control (print, pause, resume, stop, speed, G-code)
+ * - Real-time status with continuous caching from MQTT reports
+ * - Camera recording and timelapse control
+ * - AMS filament management
+ * - FTP file upload (FTPS on port 990)
+ * - X.509 certificate signing (bypass firmware auth restrictions)
+ * - Cloud API for account/printer listing
+ *
+ * Protocol reference: https://github.com/Doridian/OpenBambuAPI
+ * X.509 background: https://hackaday.com/2025/01/19/bambu-connects-authentication-x-509-certificate-and-private-key-extracted/
+ */
+
+import { Server } from "@modelcontextprotocol/sdk/server/index.js";
+import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import {
+  CallToolRequestSchema,
+  ListToolsRequestSchema,
+  Tool,
+} from "@modelcontextprotocol/sdk/types.js";
+import fetch from "node-fetch";
+import { getAppCert, type BambuLabConfig } from "./types.js";
+import { BambuMQTTClient, type MQTTConfig } from "./mqtt-client.js";
+import * as crypto from "crypto";
+import { Client as FTPClient } from "basic-ftp";
+import * as fs from "fs";
+import * as path from "path";
+
+// ===== Speed Profiles (inspired by Shockedrope/bambu-mcp-server) =====
+
+const SPEED_PROFILES: Record<string, number> = {
+  silent: 50,
+  standard: 100,
+  sport: 125,
+  ludicrous: 166,
+};
+
+// ===== Safety & Validation =====
+
+const BLOCKED_GCODE_PREFIXES = [
+  "M112", // Emergency stop (use printer_stop tool instead)
+  "M502", // Factory reset
+  "M500", // Save settings to EEPROM
+  "M501", // Restore settings from EEPROM
+  "M997", // Firmware update
+  "M999", // Restart after emergency stop
+];
+
+const SAFE_TEMP_LIMITS = {
+  nozzle: 300,
+  bed: 120,
+};
+
+const ALLOWED_UPLOAD_EXTENSIONS = [".gcode", ".3mf", ".stl"];
+
+function validateGcode(gcode: string): string | null {
+  const upper = gcode.trim().toUpperCase();
+
+  for (const prefix of BLOCKED_GCODE_PREFIXES) {
+    if (upper.startsWith(prefix)) {
+      return `G-code ${prefix} is blocked for safety. Use the appropriate MCP tool instead.`;
+    }
+  }
+
+  const tempMatch = upper.match(/^M10[49]\s+S(\d+)/);
+  if (tempMatch) {
+    const temp = parseInt(tempMatch[1]);
+    if (temp > SAFE_TEMP_LIMITS.nozzle) {
+      return `Nozzle temperature ${temp}C exceeds safe limit of ${SAFE_TEMP_LIMITS.nozzle}C`;
+    }
+  }
+
+  const bedTempMatch = upper.match(/^M140\s+S(\d+)/);
+  if (bedTempMatch) {
+    const temp = parseInt(bedTempMatch[1]);
+    if (temp > SAFE_TEMP_LIMITS.bed) {
+      return `Bed temperature ${temp}C exceeds safe limit of ${SAFE_TEMP_LIMITS.bed}C`;
+    }
+  }
+
+  return null;
+}
+
+function validateFTPPath(localPath: string): string | null {
+  const resolved = path.resolve(localPath);
+  const ext = path.extname(resolved).toLowerCase();
+
+  if (!ALLOWED_UPLOAD_EXTENSIONS.includes(ext)) {
+    return `File extension "${ext}" not allowed. Allowed: ${ALLOWED_UPLOAD_EXTENSIONS.join(", ")}`;
+  }
+
+  if (!fs.existsSync(resolved)) {
+    return `File not found: ${resolved}`;
+  }
+
+  return null;
+}
+
+function validateRemotePath(remotePath: string): string | null {
+  if (remotePath.includes("..") || remotePath.startsWith("/")) {
+    return `Invalid remote path: must be a relative filename without ".." traversal`;
+  }
+  return null;
+}
+
+// ===== Configuration =====
+
+const BASE_URL =
+  process.env.BAMBU_LAB_BASE_URL || "https://bambulab.com/api/v1";
+const AUTH_COOKIES = process.env.BAMBU_LAB_COOKIES || "";
+const APP_CERT_ID =
+  process.env.BAMBU_LAB_APP_CERT_ID ||
+  "GLOF3813734089-524a37c80000c6a6a274a47b3281";
+
+const MQTT_HOST = process.env.BAMBU_LAB_MQTT_HOST || "";
+const MQTT_PORT = parseInt(process.env.BAMBU_LAB_MQTT_PORT || "8883");
+const MQTT_USERNAME = process.env.BAMBU_LAB_MQTT_USERNAME || "bblp";
+const MQTT_PASSWORD = process.env.BAMBU_LAB_MQTT_PASSWORD || "";
+const MQTT_DEVICE_ID = process.env.BAMBU_LAB_DEVICE_ID || "";
+
+// ===== Helpers =====
+
+function ok(data: any) {
+  return {
+    content: [{ type: "text" as const, text: JSON.stringify(data, null, 2) }],
+  };
+}
+
+function err(message: string, details?: string) {
+  return {
+    content: [
+      {
+        type: "text" as const,
+        text: JSON.stringify(
+          { error: message, ...(details ? { details } : {}) },
+          null,
+          2,
+        ),
+      },
+    ],
+    isError: true,
+  };
+}
+
+// ===== MCP Server =====
+
+class BambuLabMCP {
+  private config: BambuLabConfig;
+  private server: Server;
+  private mqttClient: BambuMQTTClient | null = null;
+
+  constructor() {
+    this.config = {
+      baseUrl: BASE_URL,
+      cookies: AUTH_COOKIES,
+      appCertId: APP_CERT_ID,
+    };
+
+    this.server = new Server(
+      { name: "bambu-lab-mcp", version: "3.0.0" },
+      { capabilities: { tools: {} } },
+    );
+
+    this.setupHandlers();
+    this.initMQTT();
+  }
+
+  private async initMQTT() {
+    if (MQTT_HOST && MQTT_PASSWORD && MQTT_DEVICE_ID) {
+      try {
+        const config: MQTTConfig = {
+          host: MQTT_HOST,
+          port: MQTT_PORT,
+          username: MQTT_USERNAME,
+          password: MQTT_PASSWORD,
+          deviceId: MQTT_DEVICE_ID,
+        };
+
+        this.mqttClient = new BambuMQTTClient(config);
+        await this.mqttClient.connect();
+        console.error("[bambu-mcp] MQTT connected to", MQTT_HOST);
+      } catch (error: any) {
+        console.error("[bambu-mcp] MQTT connection failed:", error.message);
+      }
+    } else {
+      console.error(
+        "[bambu-mcp] MQTT not configured — set BAMBU_LAB_MQTT_HOST, BAMBU_LAB_MQTT_PASSWORD, BAMBU_LAB_DEVICE_ID",
+      );
+    }
+  }
+
+  private requireMQTT(): BambuMQTTClient {
+    if (!this.mqttClient || !this.mqttClient.isConnected()) {
+      throw new Error("MQTT not connected. Use mqtt_connect first.");
+    }
+    return this.mqttClient;
+  }
+
+  private setupHandlers() {
+    this.server.setRequestHandler(ListToolsRequestSchema, async () => ({
+      tools: this.getTools(),
+    }));
+
+    this.server.setRequestHandler(CallToolRequestSchema, async (request) => {
+      const { name, arguments: args } = request.params;
+      try {
+        return await this.dispatch(name, args as any);
+      } catch (error: any) {
+        console.error(`[bambu-mcp] Tool ${name} failed:`, error.message);
+        return err(error.message);
+      }
+    });
+  }
+
+  private async dispatch(name: string, args: any): Promise<any> {
+    // Cloud API
+    if (name === "get_user_profile") return await this.getUserProfile();
+    if (name === "list_printers") return await this.listPrinters();
+    if (name === "get_printer_status") return await this.getPrinterStatus(args);
+    if (name === "sign_message") return await this.signMessage(args);
+
+    // MQTT connection
+    if (name === "mqtt_connect") return await this.mqttConnect(args);
+    if (name === "mqtt_disconnect") return await this.mqttDisconnect();
+
+    // Print control
+    if (name === "printer_stop") return await this.printerStop();
+    if (name === "printer_pause") return await this.printerPause();
+    if (name === "printer_resume") return await this.printerResume();
+    if (name === "printer_set_speed") return await this.printerSetSpeed(args);
+    if (name === "printer_send_gcode") return await this.printerSendGcode(args);
+    if (name === "printer_print_file") return await this.printerPrintFile(args);
+    if (name === "printer_get_status") return await this.printerGetStatus();
+    if (name === "printer_get_cached_status")
+      return this.printerGetCachedStatus();
+    if (name === "printer_get_version") return await this.printerGetVersion();
+
+    // Object control
+    if (name === "skip_objects") return await this.skipObjects(args);
+
+    // AMS
+    if (name === "ams_change_filament")
+      return await this.amsChangeFilament(args);
+    if (name === "ams_unload_filament") return await this.amsUnloadFilament();
+
+    // Camera
+    if (name === "camera_record") return await this.cameraRecord(args);
+    if (name === "camera_timelapse") return await this.cameraTimelapse(args);
+
+    // LED
+    if (name === "led_control") return await this.ledControl(args);
+
+    // Hardware
+    if (name === "set_nozzle") return await this.setNozzle(args);
+
+    // Temperature
+    if (name === "set_temperature") return await this.setTemperature(args);
+
+    // FTP
+    if (name === "ftp_upload_file") return await this.ftpUploadFile(args);
+
+    return err(`Unknown tool: ${name}`);
+  }
+
+  // ===== Tool Definitions =====
+
+  private getTools(): Tool[] {
+    return [
+      // --- Cloud API ---
+      {
+        name: "get_user_profile",
+        description: "Get Bambu Lab cloud account profile",
+        inputSchema: { type: "object", properties: {}, required: [] },
+      },
+      {
+        name: "list_printers",
+        description: "List all printers registered to the cloud account",
+        inputSchema: { type: "object", properties: {}, required: [] },
+      },
+      {
+        name: "get_printer_status",
+        description:
+          "Get printer status via cloud API (requires cloud cookies)",
+        inputSchema: {
+          type: "object",
+          properties: {
+            device_id: { type: "string", description: "Printer device ID" },
+          },
+          required: ["device_id"],
+        },
+      },
+      {
+        name: "sign_message",
+        description:
+          "Sign a message with X.509 certificate for authenticated printer communication. Uses the extracted Bambu Connect certificate to bypass firmware auth restrictions.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            device_id: { type: "string", description: "Printer device ID" },
+            message: { type: "object", description: "Message payload to sign" },
+          },
+          required: ["device_id", "message"],
+        },
+      },
+
+      // --- MQTT Connection ---
+      {
+        name: "mqtt_connect",
+        description:
+          "Connect to a Bambu Lab printer via local MQTT over TLS. Required before any printer control commands.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            host: { type: "string", description: "Printer IP address" },
+            port: {
+              type: "number",
+              description: "MQTT port (default: 8883)",
+            },
+            username: {
+              type: "string",
+              description: 'MQTT username (default: "bblp")',
+            },
+            password: {
+              type: "string",
+              description: "LAN access code from printer screen",
+            },
+            device_id: {
+              type: "string",
+              description: "Printer serial number",
+            },
+          },
+          required: ["host", "password", "device_id"],
+        },
+      },
+      {
+        name: "mqtt_disconnect",
+        description: "Disconnect from the MQTT printer connection",
+        inputSchema: { type: "object", properties: {}, required: [] },
+      },
+
+      // --- Print Control ---
+      {
+        name: "printer_stop",
+        description: "Stop the current print job immediately",
+        inputSchema: { type: "object", properties: {}, required: [] },
+      },
+      {
+        name: "printer_pause",
+        description: "Pause the current print job",
+        inputSchema: { type: "object", properties: {}, required: [] },
+      },
+      {
+        name: "printer_resume",
+        description: "Resume a paused print job",
+        inputSchema: { type: "object", properties: {}, required: [] },
+      },
+      {
+        name: "printer_set_speed",
+        description:
+          "Set print speed. Use a named profile (silent/standard/sport/ludicrous) or a percentage (1-166).",
+        inputSchema: {
+          type: "object",
+          properties: {
+            profile: {
+              type: "string",
+              enum: ["silent", "standard", "sport", "ludicrous"],
+              description: "Named speed profile",
+            },
+            speed: {
+              type: "number",
+              description:
+                "Speed percentage (1-166). Ignored if profile is set.",
+            },
+          },
+          required: [],
+        },
+      },
+      {
+        name: "printer_send_gcode",
+        description:
+          'Send a single G-code command to the printer (e.g., "G28" for home). Dangerous commands are blocked for safety.',
+        inputSchema: {
+          type: "object",
+          properties: {
+            gcode: { type: "string", description: "G-code command" },
+          },
+          required: ["gcode"],
+        },
+      },
+      {
+        name: "printer_print_file",
+        description:
+          "Start printing a file already on the printer SD card (uploaded via ftp_upload_file)",
+        inputSchema: {
+          type: "object",
+          properties: {
+            file: {
+              type: "string",
+              description: "Filename on printer storage",
+            },
+            bed_type: {
+              type: "string",
+              enum: [
+                "auto",
+                "cool_plate",
+                "engineering_plate",
+                "textured_pei_plate",
+              ],
+              description: "Bed plate type (default: auto)",
+            },
+            timelapse: {
+              type: "boolean",
+              description: "Enable timelapse recording",
+            },
+            use_ams: {
+              type: "boolean",
+              description: "Use AMS for filament (default: true)",
+            },
+          },
+          required: ["file"],
+        },
+      },
+
+      // --- Status ---
+      {
+        name: "printer_get_status",
+        description:
+          "Request a full status push from the printer and return it. Includes temperatures, print progress, AMS state, fan speeds, and more. Note: pushall should not be called more than once every 5 minutes on P1P.",
+        inputSchema: { type: "object", properties: {}, required: [] },
+      },
+      {
+        name: "printer_get_cached_status",
+        description:
+          "Return the last cached printer status without requesting a new push. Faster and lighter than printer_get_status — use this for frequent polling.",
+        inputSchema: { type: "object", properties: {}, required: [] },
+      },
+      {
+        name: "printer_get_version",
+        description:
+          "Get firmware and module version information for the connected printer",
+        inputSchema: { type: "object", properties: {}, required: [] },
+      },
+
+      // --- Object Control ---
+      {
+        name: "skip_objects",
+        description:
+          "Skip specific objects during a multi-object print. Useful for excluding failed parts without stopping the entire print.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            object_ids: {
+              type: "array",
+              items: { type: "number" },
+              description: "Array of object IDs to skip",
+            },
+          },
+          required: ["object_ids"],
+        },
+      },
+
+      // --- AMS ---
+      {
+        name: "ams_change_filament",
+        description: "Change to a different AMS filament tray (0-3)",
+        inputSchema: {
+          type: "object",
+          properties: {
+            tray: {
+              type: "number",
+              description: "AMS tray number (0-3)",
+            },
+            target_temp: {
+              type: "number",
+              description: "Target nozzle temperature for the filament",
+            },
+          },
+          required: ["tray"],
+        },
+      },
+      {
+        name: "ams_unload_filament",
+        description: "Unload the current filament from the extruder",
+        inputSchema: { type: "object", properties: {}, required: [] },
+      },
+
+      // --- Camera ---
+      {
+        name: "camera_record",
+        description: "Enable or disable camera recording on the printer",
+        inputSchema: {
+          type: "object",
+          properties: {
+            enabled: {
+              type: "boolean",
+              description: "true to start recording, false to stop",
+            },
+          },
+          required: ["enabled"],
+        },
+      },
+      {
+        name: "camera_timelapse",
+        description:
+          "Enable or disable timelapse recording for the current print",
+        inputSchema: {
+          type: "object",
+          properties: {
+            enabled: {
+              type: "boolean",
+              description: "true to enable timelapse, false to disable",
+            },
+          },
+          required: ["enabled"],
+        },
+      },
+
+      // --- LED ---
+      {
+        name: "led_control",
+        description: "Control the printer chamber or logo LED lights",
+        inputSchema: {
+          type: "object",
+          properties: {
+            mode: {
+              type: "string",
+              enum: ["on", "off"],
+              description: "LED state",
+            },
+            node: {
+              type: "string",
+              enum: ["chamber_light", "work_light"],
+              description: "Which LED to control (default: chamber_light)",
+            },
+          },
+          required: ["mode"],
+        },
+      },
+
+      // --- Hardware ---
+      {
+        name: "set_nozzle",
+        description: "Set the nozzle diameter (for printing profile selection)",
+        inputSchema: {
+          type: "object",
+          properties: {
+            diameter: {
+              type: "number",
+              description: "Nozzle diameter in mm (e.g., 0.4, 0.6, 0.8)",
+            },
+          },
+          required: ["diameter"],
+        },
+      },
+
+      // --- Temperature ---
+      {
+        name: "set_temperature",
+        description:
+          "Set nozzle or bed temperature via G-code. Validates against safe limits.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            target: {
+              type: "string",
+              enum: ["nozzle", "bed"],
+              description: "Which heater to set",
+            },
+            temperature: {
+              type: "number",
+              description: `Temperature in Celsius (nozzle max: ${SAFE_TEMP_LIMITS.nozzle}, bed max: ${SAFE_TEMP_LIMITS.bed})`,
+            },
+          },
+          required: ["target", "temperature"],
+        },
+      },
+
+      // --- FTP ---
+      {
+        name: "ftp_upload_file",
+        description:
+          "Upload a .gcode, .3mf, or .stl file to the printer SD card via FTPS (port 990). Use printer_print_file to start the print after upload.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            host: { type: "string", description: "Printer IP address" },
+            local_path: {
+              type: "string",
+              description: "Path to local file to upload",
+            },
+            remote_path: {
+              type: "string",
+              description: "Filename on printer (e.g., model.gcode)",
+            },
+            password: {
+              type: "string",
+              description: "LAN access code from printer",
+            },
+          },
+          required: ["host", "local_path", "remote_path", "password"],
+        },
+      },
+    ];
+  }
+
+  // ===== Cloud API =====
+
+  private async makeRequest(endpoint: string, options: any = {}) {
+    if (!this.config.cookies) {
+      throw new Error(
+        "Cloud API requires BAMBU_LAB_COOKIES environment variable.",
+      );
+    }
+
+    const url = `${this.config.baseUrl}${endpoint}`;
+    const headers = {
+      Cookie: this.config.cookies,
+      "Content-Type": "application/json",
+      "x-bbl-client-type": "web",
+      "x-bbl-client-name": "Portal",
+      "x-bbl-client-version": "00.00.00.01",
+      ...options.headers,
+    };
+
+    const response = await fetch(url, { ...options, headers });
+
+    if (!response.ok) {
+      throw new Error(`Cloud API HTTP ${response.status}`);
+    }
+
+    return await response.json();
+  }
+
+  private async getUserProfile() {
+    return ok(await this.makeRequest("/user-service/my/profile"));
+  }
+
+  private async listPrinters() {
+    try {
+      return ok(await this.makeRequest("/user-service/my/devices"));
+    } catch (error: any) {
+      return ok({
+        message: "Cloud device list unavailable",
+        suggestion: "Use MQTT for local printer access",
+      });
+    }
+  }
+
+  private async getPrinterStatus(args: { device_id: string }) {
+    try {
+      return ok(
+        await this.makeRequest(
+          `/device-service/devices/${args.device_id}/status`,
+        ),
+      );
+    } catch {
+      return ok({
+        message: "Cloud status unavailable",
+        suggestion:
+          "Use mqtt_connect + printer_get_status for real-time local status",
+        device_id: args.device_id,
+      });
+    }
+  }
+
+  private async signMessage(args: { device_id: string; message: any }) {
+    const { message } = args;
+    const appCert = getAppCert();
+
+    const messageStr = JSON.stringify(message);
+    const signature = crypto
+      .sign("RSA-SHA256", Buffer.from(messageStr), appCert.privateKey)
+      .toString("base64");
+
+    const signedMessage = {
+      ...message,
+      header: {
+        sign_ver: "v1.0",
+        sign_alg: "RSA_SHA256",
+        sign_string: signature,
+        cert_id: this.config.appCertId,
+        payload_len: new TextEncoder().encode(messageStr).length,
+      },
+    };
+
+    return ok({
+      message: "Message signed successfully",
+      signed_message: signedMessage,
+    });
+  }
+
+  // ===== MQTT =====
+
+  private async mqttConnect(args: {
+    host: string;
+    port?: number;
+    username?: string;
+    password: string;
+    device_id: string;
+  }) {
+    const config: MQTTConfig = {
+      host: args.host,
+      port: args.port || 8883,
+      username: args.username || "bblp",
+      password: args.password,
+      deviceId: args.device_id,
+    };
+
+    this.mqttClient = new BambuMQTTClient(config);
+    await this.mqttClient.connect();
+
+    return ok({
+      message: "Connected to printer via MQTT",
+      host: args.host,
+      device_id: args.device_id,
+    });
+  }
+
+  private async mqttDisconnect() {
+    if (this.mqttClient) {
+      this.mqttClient.disconnect();
+      this.mqttClient = null;
+    }
+    return ok({ message: "Disconnected from MQTT" });
+  }
+
+  // ===== Print Control =====
+
+  private async printerStop() {
+    return ok({
+      message: "Print stopped",
+      result: await this.requireMQTT().stopPrint(),
+    });
+  }
+
+  private async printerPause() {
+    return ok({
+      message: "Print paused",
+      result: await this.requireMQTT().pausePrint(),
+    });
+  }
+
+  private async printerResume() {
+    return ok({
+      message: "Print resumed",
+      result: await this.requireMQTT().resumePrint(),
+    });
+  }
+
+  private async printerSetSpeed(args: { profile?: string; speed?: number }) {
+    const mqtt = this.requireMQTT();
+
+    let speed: number;
+    if (args.profile) {
+      const profileSpeed = SPEED_PROFILES[args.profile.toLowerCase()];
+      if (!profileSpeed) {
+        throw new Error(
+          `Unknown speed profile. Use: ${Object.keys(SPEED_PROFILES).join(", ")}`,
+        );
+      }
+      speed = profileSpeed;
+    } else if (args.speed !== undefined) {
+      speed = args.speed;
+    } else {
+      throw new Error("Provide either a speed profile or a speed percentage");
+    }
+
+    if (speed < 1 || speed > 166) {
+      throw new Error("Speed must be between 1 and 166");
+    }
+
+    const result = await mqtt.setPrintSpeed(speed);
+    return ok({
+      message: `Speed set to ${speed}%${args.profile ? ` (${args.profile})` : ""}`,
+      result,
+    });
+  }
+
+  private async printerSendGcode(args: { gcode: string }) {
+    const validationError = validateGcode(args.gcode);
+    if (validationError) throw new Error(validationError);
+
+    const result = await this.requireMQTT().sendGcode(args.gcode);
+    return ok({ message: `G-code sent: ${args.gcode}`, result });
+  }
+
+  private async printerPrintFile(args: {
+    file: string;
+    bed_type?: string;
+    timelapse?: boolean;
+    use_ams?: boolean;
+  }) {
+    const result = await this.requireMQTT().printFile(args);
+    return ok({ message: `Started printing: ${args.file}`, result });
+  }
+
+  // ===== Status =====
+
+  private async printerGetStatus() {
+    const status = await this.requireMQTT().requestStatus();
+    return ok(status);
+  }
+
+  private printerGetCachedStatus() {
+    const status = this.requireMQTT().getCachedStatus();
+    return ok(status);
+  }
+
+  private async printerGetVersion() {
+    return ok(await this.requireMQTT().getVersion());
+  }
+
+  // ===== Object Control =====
+
+  private async skipObjects(args: { object_ids: number[] }) {
+    if (!args.object_ids?.length) {
+      throw new Error("Provide at least one object ID to skip");
+    }
+    const result = await this.requireMQTT().skipObjects(args.object_ids);
+    return ok({
+      message: `Skipping objects: ${args.object_ids.join(", ")}`,
+      result,
+    });
+  }
+
+  // ===== AMS =====
+
+  private async amsChangeFilament(args: {
+    tray: number;
+    target_temp?: number;
+  }) {
+    if (args.tray < 0 || args.tray > 3) {
+      throw new Error("AMS tray must be between 0 and 3");
+    }
+    const result = await this.requireMQTT().changeFilament(
+      args.tray,
+      args.target_temp,
+    );
+    return ok({ message: `Changing to AMS tray ${args.tray}`, result });
+  }
+
+  private async amsUnloadFilament() {
+    return ok({
+      message: "Unloading filament",
+      result: await this.requireMQTT().unloadFilament(),
+    });
+  }
+
+  // ===== Camera =====
+
+  private async cameraRecord(args: { enabled: boolean }) {
+    const result = await this.requireMQTT().setCameraRecording(args.enabled);
+    return ok({
+      message: `Camera recording ${args.enabled ? "enabled" : "disabled"}`,
+      result,
+    });
+  }
+
+  private async cameraTimelapse(args: { enabled: boolean }) {
+    const result = await this.requireMQTT().setTimelapse(args.enabled);
+    return ok({
+      message: `Timelapse ${args.enabled ? "enabled" : "disabled"}`,
+      result,
+    });
+  }
+
+  // ===== LED =====
+
+  private async ledControl(args: { mode: "on" | "off"; node?: string }) {
+    const result = await this.requireMQTT().setLED(args.mode, args.node);
+    return ok({
+      message: `LED ${args.node || "chamber_light"} ${args.mode}`,
+      result,
+    });
+  }
+
+  // ===== Hardware =====
+
+  private async setNozzle(args: { diameter: number }) {
+    const result = await this.requireMQTT().setNozzle(args.diameter);
+    return ok({ message: `Nozzle diameter set to ${args.diameter}mm`, result });
+  }
+
+  // ===== Temperature =====
+
+  private async setTemperature(args: {
+    target: "nozzle" | "bed";
+    temperature: number;
+  }) {
+    const mqtt = this.requireMQTT();
+    const { target, temperature } = args;
+
+    const limit =
+      target === "nozzle" ? SAFE_TEMP_LIMITS.nozzle : SAFE_TEMP_LIMITS.bed;
+    if (temperature < 0 || temperature > limit) {
+      throw new Error(`${target} temperature must be between 0 and ${limit}C`);
+    }
+
+    // M104 = nozzle, M140 = bed
+    const gcode =
+      target === "nozzle" ? `M104 S${temperature}` : `M140 S${temperature}`;
+    const result = await mqtt.sendGcode(gcode);
+
+    return ok({
+      message: `${target} temperature set to ${temperature}C`,
+      gcode,
+      result,
+    });
+  }
+
+  // ===== FTP =====
+
+  private async ftpUploadFile(args: {
+    host: string;
+    local_path: string;
+    remote_path: string;
+    password: string;
+  }) {
+    const pathError = validateFTPPath(args.local_path);
+    if (pathError) throw new Error(pathError);
+
+    const remoteError = validateRemotePath(args.remote_path);
+    if (remoteError) throw new Error(remoteError);
+
+    const ftp = new FTPClient();
+    ftp.ftp.verbose = false;
+
+    try {
+      await ftp.access({
+        host: args.host,
+        port: 990,
+        user: "bblp",
+        password: args.password,
+        secure: true,
+        secureOptions: { rejectUnauthorized: false },
+      });
+
+      await ftp.uploadFrom(args.local_path, args.remote_path);
+      ftp.close();
+
+      return ok({
+        message: "File uploaded successfully",
+        local: args.local_path,
+        remote: args.remote_path,
+        next_step: `Use printer_print_file with file="${args.remote_path}" to print`,
+      });
+    } catch (error: any) {
+      ftp.close();
+      throw new Error(
+        `FTP upload failed: ${error.message}. Verify the LAN access code and that FTPS is enabled.`,
+      );
+    }
+  }
+
+  // ===== Server Lifecycle =====
+
+  async run() {
+    const transport = new StdioServerTransport();
+    await this.server.connect(transport);
+
+    console.error("=".repeat(50));
+    console.error("Bambu Lab MCP Server v3.0.0");
+    console.error("=".repeat(50));
+    console.error(
+      "Cloud:",
+      this.config.cookies ? "configured" : "not configured",
+    );
+    console.error(
+      "MQTT:",
+      this.mqttClient?.isConnected() ? "connected" : "not connected",
+    );
+    console.error("=".repeat(50));
+  }
+}
+
+const mcp = new BambuLabMCP();
+mcp.run().catch(console.error);

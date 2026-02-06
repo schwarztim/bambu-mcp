@@ -1,0 +1,44 @@
+{
+  "name": "bambu-mcp",
+  "version": "3.0.0",
+  "description": "MCP server for Bambu Lab 3D printers — MQTT control, FTP upload, X.509 certificate auth, camera, AMS, and more",
+  "type": "module",
+  "main": "dist/index.js",
+  "bin": {
+    "bambu-mcp": "dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "watch": "tsc --watch",
+    "start": "node dist/index.js",
+    "dev": "tsc --watch & node --watch dist/index.js"
+  },
+  "keywords": [
+    "mcp",
+    "bambu-lab",
+    "3d-printer",
+    "mqtt",
+    "x509",
+    "claude",
+    "model-context-protocol"
+  ],
+  "author": "schwarztim",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/schwarztim/bambu-mcp.git"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.26.0",
+    "basic-ftp": "^5.1.0",
+    "mqtt": "^5.11.1",
+    "node-fetch": "^3.3.2"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.5",
+    "typescript": "^5.7.3"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
