@@ -10,6 +10,7 @@
  * - FTP file upload (FTPS on port 990)
  * - X.509 certificate signing (bypass firmware auth restrictions)
  * - Cloud API for account/printer listing
+ * - MakerWorld integration (download models for printing)
  *
  * Protocol reference: https://github.com/Doridian/OpenBambuAPI
  * X.509 background: https://hackaday.com/2025/01/19/bambu-connects-authentication-x-509-certificate-and-private-key-extracted/
@@ -29,6 +30,12 @@ import * as crypto from "crypto";
 import { Client as FTPClient } from "basic-ftp";
 import * as fs from "fs";
 import * as path from "path";
+import { execFile } from "child_process";
+import {
+  makerWorldDownload,
+  parseMakerWorldUrl,
+  findRecent3mf,
+} from "./makerworld.js";
 
 // ===== Speed Profiles (inspired by Shockedrope/bambu-mcp-server) =====
 
@@ -263,6 +270,12 @@ class BambuLabMCP {
     // FTP
     if (name === "ftp_upload_file") return await this.ftpUploadFile(args);
 
+    // MakerWorld
+    if (name === "makerworld_download")
+      return await this.makerWorldDownload(args);
+    if (name === "makerworld_print") return await this.makerWorldPrint(args);
+    if (name === "ams_filament_mapping") return this.amsFilamentMapping();
+
     return err(`Unknown tool: ${name}`);
   }
 
@@ -394,13 +407,27 @@ class BambuLabMCP {
       {
         name: "printer_print_file",
         description:
-          "Start printing a file already on the printer SD card (uploaded via ftp_upload_file)",
+          "Start printing a file on the printer SD card (uploaded via ftp_upload_file). " +
+          "Auto-detects .3mf vs .gcode — for .3mf files uses project_file command (requires Developer Mode). " +
+          "For .3mf: ams_mapping maps print colors to AMS slots (index=color, value=slot 0-3 or -1 for external).",
         inputSchema: {
           type: "object",
           properties: {
             file: {
               type: "string",
-              description: "Filename on printer storage",
+              description:
+                "Filename on printer storage (e.g. 'model.3mf' or 'print.gcode')",
+            },
+            plate: {
+              type: "number",
+              description: "Plate number for .3mf files (1-based, default: 1)",
+            },
+            ams_mapping: {
+              type: "array",
+              items: { type: "number" },
+              description:
+                "AMS slot mapping for .3mf files. Array index = color in file, value = AMS slot (0-3) or -1 for external. " +
+                "Single color slot 0: [0]. Two colors: [0, 1]. Use ams_filament_mapping to check which slot has which filament.",
             },
             bed_type: {
               type: "string",
@@ -604,6 +631,127 @@ class BambuLabMCP {
           required: ["host", "local_path", "remote_path", "password"],
         },
       },
+
+      // --- MakerWorld ---
+      {
+        name: "makerworld_download",
+        description:
+          "Download a 3MF print file from MakerWorld (makerworld.com). " +
+          "Accepts a URL, instance_id, or path to an already-downloaded file. " +
+          "When Cloudflare blocks direct access, returns step-by-step instructions " +
+          "for browser-assisted download using Firefox DevTools MCP.\n\n" +
+          "DEPENDENCY: Firefox DevTools MCP is required for browser-based downloads. " +
+          "Install with: npx firefox-devtools-mcp@latest\n" +
+          "Add to ~/.claude/user-mcps.json:\n" +
+          '  "firefox-devtools": { "command": "npx", "args": ["firefox-devtools-mcp@latest"] }',
+        inputSchema: {
+          type: "object",
+          properties: {
+            url: {
+              type: "string",
+              description:
+                "MakerWorld model URL (e.g., https://makerworld.com/en/models/12345-model-name)",
+            },
+            instance_id: {
+              type: "string",
+              description:
+                "MakerWorld instance ID for direct download (from __NEXT_DATA__ on the model page: design.instances[].id where isDefault=true)",
+            },
+            download_path: {
+              type: "string",
+              description:
+                "Path to an already-downloaded 3MF file (skips download, validates and returns file info)",
+            },
+            cookies: {
+              type: "string",
+              description:
+                "Browser cookies for Cloudflare bypass (extract from Firefox DevTools network request headers)",
+            },
+            output_dir: {
+              type: "string",
+              description: "Directory to save the file (default: ~/Downloads)",
+            },
+          },
+          required: [],
+        },
+      },
+      {
+        name: "makerworld_print",
+        description:
+          "Download a model from MakerWorld and print it on the connected printer. " +
+          "Combines makerworld_download → ftp_upload → printer_print_file in one step.\n\n" +
+          "DEPENDENCY: Firefox DevTools MCP for MakerWorld access. " +
+          "Install: npx firefox-devtools-mcp@latest",
+        inputSchema: {
+          type: "object",
+          properties: {
+            url: {
+              type: "string",
+              description: "MakerWorld model URL",
+            },
+            download_path: {
+              type: "string",
+              description: "Path to already-downloaded 3MF (skips download)",
+            },
+            instance_id: {
+              type: "string",
+              description: "MakerWorld instance ID for direct download",
+            },
+            cookies: {
+              type: "string",
+              description: "Browser cookies for Cloudflare bypass",
+            },
+            host: {
+              type: "string",
+              description:
+                "Printer IP (defaults to currently connected MQTT printer)",
+            },
+            password: {
+              type: "string",
+              description:
+                "Printer access code (defaults to current MQTT password)",
+            },
+            plate: {
+              type: "number",
+              description:
+                "Plate number for multi-plate 3MF files (1-based, default: 1)",
+            },
+            ams_mapping: {
+              type: "array",
+              items: { type: "number" },
+              description:
+                "AMS slot mapping. Index = color in file, value = AMS slot (0-3) or -1 for external. Default: [0]",
+            },
+            bed_type: {
+              type: "string",
+              enum: [
+                "auto",
+                "cool_plate",
+                "engineering_plate",
+                "textured_pei_plate",
+              ],
+              description: "Bed plate type (default: auto)",
+            },
+            use_ams: {
+              type: "boolean",
+              description: "Use AMS for filament (default: true)",
+            },
+            timelapse: {
+              type: "boolean",
+              description: "Record timelapse (default: false)",
+            },
+          },
+          required: [],
+        },
+      },
+      {
+        name: "ams_filament_mapping",
+        description:
+          "Get the current AMS filament tray mapping — shows which filament " +
+          "type and color is loaded in each slot (0-3). Useful for selecting " +
+          "the right tray before printing.",
+        inputSchema: { type: "object", properties: {}, required: [] },
+      },
     ];
   }
 
@@ -790,6 +938,8 @@ class BambuLabMCP {
 
   private async printerPrintFile(args: {
     file: string;
+    plate?: number;
+    ams_mapping?: number[];
     bed_type?: string;
     timelapse?: boolean;
     use_ams?: boolean;
@@ -914,6 +1064,34 @@ class BambuLabMCP {
 
   // ===== FTP =====
 
+  /**
+   * Upload via curl FTPS (reliable fallback for P1S which has basic-ftp timeout issues)
+   */
+  private async ftpUploadViaCurl(args: {
+    host: string;
+    local_path: string;
+    remote_path: string;
+    password: string;
+  }): Promise<void> {
+    return new Promise((resolve, reject) => {
+      const ftpsUrl = `ftps://bblp:${args.password}@${args.host}:990/${args.remote_path}`;
+      execFile(
+        "curl",
+        ["--ftp-ssl-reqd", "--insecure", "-T", args.local_path, ftpsUrl],
+        { timeout: 60000 },
+        (error, _stdout, stderr) => {
+          if (error) {
+            reject(
+              new Error(`curl FTPS upload failed: ${stderr || error.message}`),
+            );
+          } else {
+            resolve();
+          }
+        },
+      );
+    });
+  }
+
   private async ftpUploadFile(args: {
     host: string;
     local_path: string;
@@ -926,10 +1104,11 @@ class BambuLabMCP {
     const remoteError = validateRemotePath(args.remote_path);
     if (remoteError) throw new Error(remoteError);
 
-    const ftp = new FTPClient();
-    ftp.ftp.verbose = false;
-
+    // Try basic-ftp first, fall back to curl on timeout
     try {
+      const ftp = new FTPClient();
+      ftp.ftp.verbose = false;
+
       await ftp.access({
         host: args.host,
         port: 990,
@@ -941,19 +1120,146 @@ class BambuLabMCP {
 
       await ftp.uploadFrom(args.local_path, args.remote_path);
       ftp.close();
+    } catch (ftpError: any) {
+      console.error(
+        `basic-ftp failed (${ftpError.message}), falling back to curl`,
+      );
+      await this.ftpUploadViaCurl(args);
+    }
 
+    return ok({
+      message: "File uploaded successfully",
+      local: args.local_path,
+      remote: args.remote_path,
+      next_step: `Use printer_print_file with file="${args.remote_path}" to print`,
+    });
+  }
+
+  // ===== MakerWorld =====
+
+  private async makerWorldDownload(args: {
+    url?: string;
+    instance_id?: string;
+    download_path?: string;
+    cookies?: string;
+    output_dir?: string;
+  }) {
+    const result = await makerWorldDownload(args);
+    return ok(result);
+  }
+
+  private async makerWorldPrint(args: {
+    url?: string;
+    download_path?: string;
+    instance_id?: string;
+    cookies?: string;
+    host?: string;
+    password?: string;
+    bed_type?: string;
+    use_ams?: boolean;
+    ams_mapping?: number[];
+    plate?: number;
+    timelapse?: boolean;
+  }) {
+    // Step 1: Get the file
+    const dlResult = await makerWorldDownload({
+      url: args.url,
+      instance_id: args.instance_id,
+      download_path: args.download_path,
+      cookies: args.cookies,
+    });
+
+    // If we got browser workflow instructions, return them
+    if (dlResult.steps) {
       return ok({
-        message: "File uploaded successfully",
-        local: args.local_path,
-        remote: args.remote_path,
-        next_step: `Use printer_print_file with file="${args.remote_path}" to print`,
+        ...dlResult,
+        message:
+          "Download requires browser assistance. Complete the download steps, then call makerworld_print again with download_path.",
       });
-    } catch (error: any) {
-      ftp.close();
-      throw new Error(
-        `FTP upload failed: ${error.message}. Verify the LAN access code and that FTPS is enabled.`,
+    }
+
+    const filePath = dlResult.path;
+    if (!filePath) {
+      return err("No file path in download result", JSON.stringify(dlResult));
+    }
+
+    // Step 2: Get printer connection info
+    const mqtt = this.requireMQTT();
+    const host = args.host || MQTT_HOST || mqtt["config"]?.host;
+    const password = args.password || MQTT_PASSWORD || mqtt["config"]?.password;
+
+    if (!host || !password) {
+      return err(
+        "Printer host and password required for FTP upload. Connect via MQTT first or provide host/password.",
       );
     }
+
+    // Step 3: Upload via FTP
+    const remoteName = path.basename(filePath);
+    const uploadResult = await this.ftpUploadFile({
+      host,
+      local_path: filePath,
+      remote_path: remoteName,
+      password,
+    });
+
+    // Step 4: Start printing
+    const printResult = await this.printerPrintFile({
+      file: remoteName,
+      plate: args.plate,
+      ams_mapping: args.ams_mapping,
+      bed_type: args.bed_type,
+      use_ams: args.use_ams,
+      timelapse: args.timelapse,
+    });
+
+    return ok({
+      message: `Printing ${remoteName} from MakerWorld`,
+      download: dlResult,
+      upload: uploadResult,
+      print: printResult,
+    });
+  }
+
+  // ===== AMS Filament Mapping =====
+
+  private amsFilamentMapping() {
+    const mqtt = this.requireMQTT();
+    const status = mqtt.getCachedStatus();
+    const ams = status?.ams;
+
+    if (!ams?.ams?.length) {
+      return ok({
+        message:
+          "No AMS data available. Request a status update first with printer_get_status.",
+        suggestion:
+          "Call printer_get_status to refresh AMS data, then try again.",
+      });
+    }
+
+    const mapping = ams.ams.flatMap((unit: any) => {
+      const unitId = unit.id;
+      const trays = (unit.tray || []).map((tray: any) => {
+        const color = tray.tray_color ? `#${tray.tray_color}` : "unknown";
+        return {
+          unit: parseInt(unitId),
+          slot: parseInt(tray.id),
+          global_slot: parseInt(unitId) * 4 + parseInt(tray.id),
+          filament_type: tray.tray_type || "empty",
+          color,
+          color_hex: tray.tray_color || null,
+          remaining_percent: tray.remain ?? null,
+          tray_sub_brands: tray.tray_sub_brands || null,
+        };
+      });
+      return trays;
+    });
+
+    return ok({
+      message: "AMS filament tray mapping",
+      current_tray: ams.tray_now,
+      trays: mapping,
+    });
   }
 
   // ===== Server Lifecycle =====

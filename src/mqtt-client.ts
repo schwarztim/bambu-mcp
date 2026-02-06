@@ -305,9 +305,9 @@ export class BambuMQTTClient {
   }
 
   /**
-   * Load and print a file from local storage
+   * Print a .gcode file from local storage
    */
-  async printFile(options: {
+  async printGcodeFile(options: {
     file: string;
     bed_type?: string;
     bed_levelling?: boolean;
@@ -327,6 +327,86 @@ export class BambuMQTTClient {
       layer_inspect: options.layer_inspect || false,
       timelapse: options.timelapse || false,
       use_ams: options.use_ams !== false,
+    });
+  }
+
+  /**
+   * Print a .3mf file from local storage using project_file command.
+   *
+   * The 3MF must already be on the printer's SD card (uploaded via FTP).
+   * Uses file:///sdcard/ URL format for P1S/P1P/X1/A1 printers.
+   *
+   * Requires Developer Mode enabled on the printer (Settings → LAN Only → Developer Mode).
+   *
+   * @param options.file - Filename on SD card (e.g. "model.3mf")
+   * @param options.plate - Plate number (1-based, default 1)
+   * @param options.ams_mapping - Array mapping print colors to AMS slots.
+   *   Index = color in file, value = AMS slot (0-3) or -1 for external spool.
+   *   Single color from slot 0: [0]. Two colors: [0, 1].
+   */
+  async print3mfFile(options: {
+    file: string;
+    plate?: number;
+    ams_mapping?: number[];
+    bed_type?: string;
+    bed_leveling?: boolean;
+    flow_cali?: boolean;
+    vibration_cali?: boolean;
+    layer_inspect?: boolean;
+    timelapse?: boolean;
+    use_ams?: boolean;
+    subtask_name?: string;
+  }): Promise<any> {
+    const plate = options.plate || 1;
+    const useAms = options.use_ams !== false;
+    const amsMapping = options.ams_mapping || [0];
+
+    return this.sendCommand("print.project_file", {
+      param: `Metadata/plate_${plate}.gcode`,
+      file: options.file,
+      url: `file:///sdcard/${options.file}`,
+      subtask_name: options.subtask_name || options.file.replace(/\.3mf$/i, ""),
+      project_id: "0",
+      profile_id: "0",
+      task_id: "0",
+      subtask_id: "0",
+      bed_type: options.bed_type || "auto",
+      bed_leveling: options.bed_leveling !== false,
+      flow_cali: options.flow_cali !== false,
+      vibration_cali: options.vibration_cali !== false,
+      layer_inspect: options.layer_inspect || false,
+      timelapse: options.timelapse || false,
+      use_ams: useAms,
+      ams_mapping: amsMapping,
+    });
+  }
+
+  /**
+   * Print a file (auto-detects .3mf vs .gcode)
+   */
+  async printFile(options: {
+    file: string;
+    plate?: number;
+    ams_mapping?: number[];
+    bed_type?: string;
+    bed_levelling?: boolean;
+    bed_leveling?: boolean;
+    flow_cali?: boolean;
+    vibration_cali?: boolean;
+    layer_inspect?: boolean;
+    timelapse?: boolean;
+    use_ams?: boolean;
+    subtask_name?: string;
+  }): Promise<any> {
+    if (options.file.toLowerCase().endsWith(".3mf")) {
+      return this.print3mfFile({
+        ...options,
+        bed_leveling: options.bed_leveling ?? options.bed_levelling,
+      });
+    }
+    return this.printGcodeFile({
+      ...options,
+      bed_levelling: options.bed_levelling ?? options.bed_leveling,
     });
   }
 
