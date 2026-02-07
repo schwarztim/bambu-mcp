@@ -887,6 +887,11 @@ class BambuLabMCP {
               description:
                 "Directory to save snapshots (default: ~/Downloads/printer_monitor)",
             },
+            fail_strikes: {
+              type: "number",
+              description:
+                "Number of consecutive vision failures required before emergency stop (default: 3). Prevents false positives from single ambiguous frames.",
+            },
           },
           required: [],
         },
@@ -1439,6 +1444,7 @@ class BambuLabMCP {
     interval_seconds?: number;
     min_layer?: number;
     snapshot_dir?: string;
+    fail_strikes?: number;
   }) {
     if (this.printMonitor) {
       const state = this.printMonitor.getState();
@@ -1471,10 +1477,13 @@ class BambuLabMCP {
       args.snapshot_dir ||
       path.join(os.homedir(), "Downloads", "printer_monitor");
 
+    const failStrikes = Math.max(args.fail_strikes || 3, 1);
+
     this.printMonitor = new PrintMonitor(
       {
         intervalSeconds,
         minLayerForVision: args.min_layer ?? 2,
+        failStrikes,
         host,
         accessCode,
         snapshotDir,
@@ -1508,6 +1517,7 @@ class BambuLabMCP {
       message: "Print monitor started",
       interval_seconds: intervalSeconds,
       min_layer: args.min_layer ?? 2,
+      fail_strikes: failStrikes,
       snapshot_dir: snapshotDir,
       vision_provider: `${visionProvider.name}/${visionProvider.model}`,
     });

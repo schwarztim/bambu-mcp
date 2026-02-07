@@ -20,6 +20,7 @@ import type {
 export interface MonitorConfig {
   intervalSeconds: number;
   minLayerForVision: number;
+  failStrikes: number;
   host: string;
   accessCode: string;
   snapshotDir: string;
@@ -30,6 +31,7 @@ export interface MonitorState {
   cycleCount: number;
   lastVerdict: VisionAnalysisResult | null;
   lastSnapshotPath: string | null;
+  consecutiveFailures: number;
   failureDetected: boolean;
   failureReason: string | null;
   emergencyStopSent: boolean;
@@ -66,6 +68,7 @@ export class PrintMonitor {
       cycleCount: 0,
       lastVerdict: null,
       lastSnapshotPath: null,
+      consecutiveFailures: 0,
       failureDetected: false,
       failureReason: null,
       emergencyStopSent: false,
@@ -89,6 +92,7 @@ export class PrintMonitor {
       "info",
       `Monitor started: ${this.config.intervalSeconds}s interval, ` +
         `vision after layer ${this.config.minLayerForVision}, ` +
+        `${this.config.failStrikes} strikes to kill, ` +
         `provider: ${this.deps.visionProvider.name}/${this.deps.visionProvider.model}`,
     );
 
@@ -202,14 +206,35 @@ export class PrintMonitor {
           this.state.lastVerdict = verdict;
 
           if (verdict.failed) {
-            await this.handleFailure(`Vision: ${verdict.reason}`);
-            return;
-          }
+            this.state.consecutiveFailures++;
+            const strikes = this.state.consecutiveFailures;
+            const needed = this.config.failStrikes;
 
-          this.deps.onLog(
-            "info",
-            `Cycle ${cycleNum}: Vision OK (${verdict.latencyMs}ms) — ${verdict.reason.slice(0, 80)}`,
-          );
+            if (strikes >= needed) {
+              await this.handleFailure(
+                `Vision: ${verdict.reason} (${strikes}/${needed} consecutive strikes)`,
+              );
+              return;
+            }
+
+            this.deps.onLog(
+              "warning",
+              `Cycle ${cycleNum}: STRIKE ${strikes}/${needed} — ${verdict.reason} (${verdict.latencyMs}ms)`,
+            );
+          } else {
+            if (this.state.consecutiveFailures > 0) {
+              this.deps.onLog(
+                "info",
+                `Cycle ${cycleNum}: Vision OK — strike counter reset (was ${this.state.consecutiveFailures})`,
+              );
+            }
+            this.state.consecutiveFailures = 0;
+
+            this.deps.onLog(
+              "info",
+              `Cycle ${cycleNum}: Vision OK (${verdict.latencyMs}ms) — ${verdict.reason.slice(0, 80)}`,
+            );
+          }
         } catch (visionErr: any) {
           // Vision API errors are non-fatal — don't stop the print
           const msg = `Cycle ${cycleNum}: vision error: ${visionErr.message}`;
