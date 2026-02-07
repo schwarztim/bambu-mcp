@@ -281,25 +281,28 @@ ${stageContext}
 
 NORMAL — do NOT flag:
 - Glue residue (white/cloudy smears on the build plate)
-- Purge lines, purge blobs, or wipe towers at the plate edges (AMS filament changes leave small purge pieces — this is NORMAL)
+- Purge lines, purge blobs, or wipe towers ANYWHERE on the bed (AMS color changes drop purge blobs mid-print — these can appear suddenly at any time during a multi-color print and are completely NORMAL, even if they look like messy clumps of filament)
 - Skirt/brim outlines around objects
 - Thin first layers during early print stages
 - Motion blur on the toolhead or gantry
 - Small wisps of stringing between nearby parts (cosmetic, not failure)
 - Objects that look short/flat because the print is still early
-- Small debris or filament scraps on the bed from previous prints or AMS purges
+- ANY pre-existing objects, blobs, filament scraps, or debris sitting on the bed — these are leftovers from previous prints and are completely NORMAL. They may be colorful, tangled, or messy-looking but they are NOT an active failure.
+- Static blobs or clumps of filament anywhere on the bed that are NOT connected to the nozzle
 
-FAILURE — only flag these when CLEARLY visible:
-- Spaghetti: a chaotic tangled mess of filament that is obviously NOT part of any structured print. Must look like a bird's nest or random loops.
-- Detachment: a printed object has clearly fallen over, shifted position, or peeled entirely off the bed
+FAILURE — only flag these when CLEARLY and ACTIVELY happening:
+- Spaghetti: filament being ACTIVELY extruded by the nozzle into a chaotic tangled mess instead of structured layers. The spaghetti must be connected to or growing from the nozzle/active print area. Static debris already sitting on the bed is NOT spaghetti.
+- Detachment: a printed object has clearly fallen over, shifted position, or peeled entirely off the bed DURING this print
 - Printing into air: the nozzle is extruding filament high above the bed with NO object underneath it
-- Blob: a large irregular molten mass engulfing the nozzle or print
+
+KEY DISTINCTION: Only flag ACTIVE failures — problems happening RIGHT NOW with the current print. Pre-existing objects, blobs, scraps, or debris on the bed from previous prints are NOT failures regardless of how messy they look.
 
 CRITICAL RULES:
 1. You MUST be conservative. A false positive stops the print and wastes time, material, and money.
-2. If you are less than 90% confident it is a failure, say OK.
-3. Glue residue is NOT stringing. Thin early layers are NOT detachment.
+2. If you are less than 95% confident it is an ACTIVE failure, say OK.
+3. Glue residue is NOT stringing. Thin early layers are NOT detachment. Blobs on the bed are NOT spaghetti.
 4. One image can be ambiguous — when in doubt, ALWAYS say OK.
+5. If something looks messy but is NOT connected to the nozzle or active print, it is pre-existing debris — say OK.
 
 Respond with EXACTLY one line:
 VERDICT: OK
