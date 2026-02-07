@@ -124,6 +124,14 @@ export class PrintMonitor {
     const cycleNum = this.state.cycleCount;
 
     try {
+      // 0. Check MQTT is still connected
+      if (!this.deps.mqttClient.isConnected()) {
+        const msg = `Cycle ${cycleNum}: MQTT disconnected — status data is stale, skipping vision analysis`;
+        this.state.errors.push(msg);
+        this.deps.onLog("warning", msg);
+        return;
+      }
+
       // 1. Get MQTT status
       const status = this.deps.mqttClient.getCachedStatus();
       const printState = (status.gcode_state as string) || "UNKNOWN";

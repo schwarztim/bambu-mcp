@@ -96,7 +96,18 @@ export class BambuMQTTClient {
   }
 
   async connect(): Promise<void> {
+    // Clean up any previous client to prevent zombie reconnect loops
+    if (this.client) {
+      try {
+        this.client.end(true);
+      } catch {}
+      this.client = null;
+      this.connected = false;
+    }
+
     return new Promise((resolve, reject) => {
+      let settled = false;
+
       const options: mqtt.IClientOptions = {
         host: this.config.host,
         port: this.config.port,
@@ -104,17 +115,22 @@ export class BambuMQTTClient {
         username: this.config.username,
         password: this.config.password,
         rejectUnauthorized: false,
-        reconnectPeriod: 5000,
+        reconnectPeriod: 0, // Disable auto-reconnect during initial connect
         connectTimeout: 10000,
       };
 
       this.client = mqtt.connect(options);
 
       this.client.on("connect", () => {
+        if (settled) return;
+        settled = true;
         console.error(
           `Connected to MQTT broker at ${this.config.host}:${this.config.port}`,
         );
         this.connected = true;
+
+        // Enable reconnect now that we've connected successfully
+        this.client!.options.reconnectPeriod = 5000;
 
         const reportTopic = `device/${this.config.deviceId}/report`;
         this.client!.subscribe(reportTopic, (err) => {
@@ -144,19 +160,48 @@ export class BambuMQTTClient {
 
       this.client.on("error", (err) => {
         console.error("MQTT connection error:", err);
-        if (!this.connected) {
-          reject(err);
+        if (!settled) {
+          settled = true;
+          // Clean up — don't leave a zombie client retrying in the background
+          try {
+            this.client?.end(true);
+          } catch {}
+          this.client = null;
+          reject(this.enhanceConnectionError(err));
         }
       });
 
       this.client.on("close", () => {
         this.connected = false;
+        if (!settled) {
+          settled = true;
+          try {
+            this.client?.end(true);
+          } catch {}
+          this.client = null;
+          reject(
+            this.enhanceConnectionError(
+              new Error("Connection closed before MQTT handshake completed"),
+            ),
+          );
+        }
       });
 
       this.client.on("reconnect", () => {
         console.error("MQTT reconnecting...");
       });
     });
+  }
+
+  private enhanceConnectionError(err: Error): Error {
+    const msg = err.message || "";
+    if (msg.includes("ECONNRESET") || msg.includes("connack timeout")) {
+      return new Error(
+        `${msg}. Bambu printers allow only one MQTT client — ` +
+          "close BambuStudio, OrcaSlicer, or Home Assistant and retry.",
+      );
+    }
+    return err;
   }
 
   disconnect(): void {
