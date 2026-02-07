@@ -38,6 +38,8 @@ import {
   parseMakerWorldUrl,
   findRecent3mf,
 } from "./makerworld.js";
+import { PrintMonitor, type MonitorState } from "./print-monitor.js";
+import { createVisionProvider } from "./vision-provider.js";
 
 // ===== Speed Profiles (inspired by Shockedrope/bambu-mcp-server) =====
 
@@ -435,6 +437,7 @@ class BambuLabMCP {
   private config: BambuLabConfig;
   private server: Server;
   private mqttClient: BambuMQTTClient | null = null;
+  private printMonitor: PrintMonitor | null = null;
 
   constructor() {
     this.config = {
@@ -444,8 +447,8 @@ class BambuLabMCP {
     };
 
     this.server = new Server(
-      { name: "bambu-lab-mcp", version: "3.0.0" },
-      { capabilities: { tools: {} } },
+      { name: "bambu-lab-mcp", version: "3.1.0" },
+      { capabilities: { tools: {}, logging: {} } },
     );
 
     this.setupHandlers();
@@ -534,6 +537,11 @@ class BambuLabMCP {
     if (name === "camera_record") return await this.cameraRecord(args);
     if (name === "camera_timelapse") return await this.cameraTimelapse(args);
     if (name === "camera_snapshot") return await this.cameraSnapshot(args);
+
+    // Vision Monitor
+    if (name === "monitor_start") return await this.monitorStart(args);
+    if (name === "monitor_status") return this.monitorStatus();
+    if (name === "monitor_stop") return this.monitorStop();
 
     // LED
     if (name === "led_control") return await this.ledControl(args);
@@ -849,6 +857,53 @@ class BambuLabMCP {
           },
           required: [],
         },
+      },
+
+      // --- Vision Monitor ---
+      {
+        name: "monitor_start",
+        description:
+          "Start AI-powered print monitoring. Captures camera snapshots on an interval, " +
+          "checks MQTT status for errors, and runs AI vision analysis to detect failures " +
+          "(spaghetti, detachment, blobs). Automatically sends emergency stop on failure. " +
+          "Works with any Bambu printer that has a camera. " +
+          "Requires: MQTT connected + a vision provider configured via env vars " +
+          "(AZURE_OPENAI_API_KEY, OPENAI_API_KEY, or ANTHROPIC_API_KEY).",
+        inputSchema: {
+          type: "object",
+          properties: {
+            interval_seconds: {
+              type: "number",
+              description:
+                "Seconds between monitoring cycles (default: 60, min: 10)",
+            },
+            min_layer: {
+              type: "number",
+              description:
+                "Skip AI vision before this layer number (default: 2). Early layers have too little material to judge.",
+            },
+            snapshot_dir: {
+              type: "string",
+              description:
+                "Directory to save snapshots (default: ~/Downloads/printer_monitor)",
+            },
+          },
+          required: [],
+        },
+      },
+      {
+        name: "monitor_status",
+        description:
+          "Get the current state of the AI print monitor — cycle count, last verdict, " +
+          "print progress, failure status, and any non-fatal errors.",
+        inputSchema: { type: "object", properties: {}, required: [] },
+      },
+      {
+        name: "monitor_stop",
+        description:
+          "Stop the AI print monitor. Returns a summary of the monitoring session. " +
+          "Does NOT stop the print itself — use printer_stop for that.",
+        inputSchema: { type: "object", properties: {}, required: [] },
       },
 
       // --- LED ---
@@ -1378,6 +1433,121 @@ class BambuLabMCP {
     });
   }
 
+  // ===== Vision Monitor =====
+
+  private async monitorStart(args: {
+    interval_seconds?: number;
+    min_layer?: number;
+    snapshot_dir?: string;
+  }) {
+    if (this.printMonitor) {
+      const state = this.printMonitor.getState();
+      if (state.active) {
+        return err(
+          "Monitor is already running. Use monitor_stop first, or monitor_status to check progress.",
+        );
+      }
+    }
+
+    const mqtt = this.requireMQTT();
+
+    let visionProvider;
+    try {
+      visionProvider = createVisionProvider();
+    } catch (e: any) {
+      return err(e.message);
+    }
+
+    const host = MQTT_HOST;
+    const accessCode = MQTT_PASSWORD;
+    if (!host || !accessCode) {
+      return err(
+        "Camera requires printer host and access code. Set BAMBU_LAB_MQTT_HOST and BAMBU_LAB_MQTT_PASSWORD.",
+      );
+    }
+
+    const intervalSeconds = Math.max(args.interval_seconds || 60, 10);
+    const snapshotDir =
+      args.snapshot_dir ||
+      path.join(os.homedir(), "Downloads", "printer_monitor");
+
+    this.printMonitor = new PrintMonitor(
+      {
+        intervalSeconds,
+        minLayerForVision: args.min_layer ?? 2,
+        host,
+        accessCode,
+        snapshotDir,
+      },
+      {
+        captureSnapshot,
+        mqttClient: mqtt,
+        visionProvider,
+        onLog: (level, message) => {
+          console.error(`[monitor] [${level}] ${message}`);
+          try {
+            this.server.sendLoggingMessage({
+              level:
+                level === "info"
+                  ? "info"
+                  : level === "warning"
+                    ? "warning"
+                    : "error",
+              data: message,
+            });
+          } catch {
+            // Logging notification failures are non-fatal
+          }
+        },
+      },
+    );
+
+    this.printMonitor.start();
+
+    return ok({
+      message: "Print monitor started",
+      interval_seconds: intervalSeconds,
+      min_layer: args.min_layer ?? 2,
+      snapshot_dir: snapshotDir,
+      vision_provider: `${visionProvider.name}/${visionProvider.model}`,
+    });
+  }
+
+  private monitorStatus() {
+    if (!this.printMonitor) {
+      return ok({
+        active: false,
+        message: "No monitor running. Use monitor_start to begin monitoring.",
+      });
+    }
+    return ok(this.printMonitor.getState());
+  }
+
+  private monitorStop() {
+    if (!this.printMonitor) {
+      return ok({
+        active: false,
+        message: "No monitor running.",
+      });
+    }
+
+    const finalState = this.printMonitor.stop();
+    this.printMonitor = null;
+
+    return ok({
+      message: "Monitor stopped",
+      summary: {
+        cycles_completed: finalState.cycleCount,
+        failure_detected: finalState.failureDetected,
+        failure_reason: finalState.failureReason,
+        emergency_stop_sent: finalState.emergencyStopSent,
+        last_print_state: finalState.printState,
+        last_print_percent: finalState.printPercent,
+        errors: finalState.errors,
+      },
+    });
+  }
+
   // ===== LED =====
 
   private async ledControl(args: { mode: "on" | "off"; node?: string }) {
@@ -1670,7 +1840,7 @@ class BambuLabMCP {
     await this.server.connect(transport);
 
     console.error("=".repeat(50));
-    console.error("Bambu Lab MCP Server v3.0.0");
+    console.error("Bambu Lab MCP Server v3.1.0");
     console.error("=".repeat(50));
     console.error(
       "Cloud:",

@@ -1,6 +1,6 @@
 {
   "name": "bambu-mcp",
-  "version": "3.0.0",
+  "version": "3.1.0",
   "description": "MCP server for Bambu Lab 3D printers — MQTT control, FTP upload, X.509 certificate auth, camera, AMS, and more",
   "type": "module",
   "main": "dist/index.js",
