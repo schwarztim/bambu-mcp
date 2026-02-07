@@ -5,7 +5,7 @@
  * Complete MCP server for Bambu Lab 3D printers featuring:
  * - Local MQTT control (print, pause, resume, stop, speed, G-code)
  * - Real-time status with continuous caching from MQTT reports
- * - Camera recording and timelapse control
+ * - Camera snapshots (TLS stream on port 6000), recording, and timelapse
  * - AMS filament management
  * - FTP file upload (FTPS on port 990)
  * - X.509 certificate signing (bypass firmware auth restrictions)
@@ -31,6 +31,7 @@ import { Client as FTPClient } from "basic-ftp";
 import * as fs from "fs";
 import * as path from "path";
 import * as os from "os";
+import * as tls from "tls";
 import { execFile, execFileSync } from "child_process";
 import {
   makerWorldDownload,
@@ -308,6 +309,87 @@ async function slice3mf(
   }
 }
 
+// ===== Camera Snapshot =====
+
+/**
+ * Capture a single JPEG frame from the printer's camera stream.
+ *
+ * Protocol (reverse-engineered from HA Bambulab integration):
+ * - TLS connection to port 6000
+ * - 80-byte auth: 16-byte header + 32-byte username + 32-byte access code
+ * - Frames arrive as: 16-byte header (payload size in bytes 0-2 LE) + JPEG data
+ */
+function captureSnapshot(
+  host: string,
+  accessCode: string,
+  outputPath: string,
+): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const sock = tls.connect(
+      { host, port: 6000, rejectUnauthorized: false },
+      () => {
+        const auth = Buffer.alloc(80, 0);
+        auth.writeUInt32LE(0x40, 0);
+        auth.writeUInt32LE(0x3000, 4);
+        Buffer.from("bblp", "ascii").copy(auth, 16);
+        Buffer.from(accessCode, "ascii").copy(auth, 48);
+        sock.write(auth);
+      },
+    );
+
+    let pending = Buffer.alloc(0);
+    let payloadSize = 0;
+    let frameBuf: Buffer | null = null;
+    let done = false;
+
+    sock.on("data", (chunk) => {
+      if (done) return;
+      pending = Buffer.concat([pending, chunk]);
+
+      while (pending.length > 0 && !done) {
+        if (frameBuf === null) {
+          if (pending.length < 16) break;
+          payloadSize = pending[0] | (pending[1] << 8) | (pending[2] << 16);
+          frameBuf = Buffer.alloc(0);
+          pending = pending.subarray(16);
+        } else {
+          const needed = payloadSize - frameBuf.length;
+          const take = Math.min(needed, pending.length);
+          frameBuf = Buffer.concat([frameBuf, pending.subarray(0, take)]);
+          pending = pending.subarray(take);
+
+          if (frameBuf.length === payloadSize) {
+            const validStart = frameBuf[0] === 0xff && frameBuf[1] === 0xd8;
+            const validEnd =
+              frameBuf[frameBuf.length - 2] === 0xff &&
+              frameBuf[frameBuf.length - 1] === 0xd9;
+
+            if (validStart && validEnd) {
+              fs.writeFileSync(outputPath, frameBuf);
+              done = true;
+              sock.destroy();
+              resolve(outputPath);
+              return;
+            }
+            frameBuf = null;
+          }
+        }
+      }
+    });
+
+    sock.on("error", (err) => {
+      if (!done) reject(new Error(`Camera stream error: ${err.message}`));
+    });
+
+    setTimeout(() => {
+      if (!done) {
+        sock.destroy();
+        reject(new Error("Camera snapshot timed out (10s)"));
+      }
+    }, 10000);
+  });
+}
+
 // ===== Configuration =====
 
 const BASE_URL =
@@ -451,6 +533,7 @@ class BambuLabMCP {
     // Camera
     if (name === "camera_record") return await this.cameraRecord(args);
     if (name === "camera_timelapse") return await this.cameraTimelapse(args);
+    if (name === "camera_snapshot") return await this.cameraSnapshot(args);
 
     // LED
     if (name === "led_control") return await this.ledControl(args);
@@ -738,6 +821,33 @@ class BambuLabMCP {
             },
           },
           required: ["enabled"],
+        },
+      },
+
+      {
+        name: "camera_snapshot",
+        description:
+          "Capture a live JPEG snapshot from the printer's chamber camera. " +
+          "Connects via TLS to port 6000, authenticates, and grabs a single frame. " +
+          "Returns the file path to the saved JPEG image.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            host: {
+              type: "string",
+              description: "Printer IP (defaults to MQTT-connected printer)",
+            },
+            password: {
+              type: "string",
+              description: "Printer access code (defaults to MQTT password)",
+            },
+            output_path: {
+              type: "string",
+              description:
+                "Where to save the JPEG (default: ~/Downloads/printer_snapshot.jpg)",
+            },
+          },
+          required: [],
         },
       },
 
@@ -1233,6 +1343,38 @@ class BambuLabMCP {
     return ok({
       message: `Timelapse ${args.enabled ? "enabled" : "disabled"}`,
       result,
+    });
+  }
+
+  private async cameraSnapshot(args: {
+    host?: string;
+    password?: string;
+    output_path?: string;
+  }) {
+    const host = args.host || MQTT_HOST;
+    const password = args.password || MQTT_PASSWORD;
+
+    if (!host || !password) {
+      return err(
+        "Printer host and access code required. Connect via MQTT first or provide host/password.",
+      );
+    }
+
+    const outputPath =
+      args.output_path ||
+      path.join(
+        os.homedir(),
+        "Downloads",
+        `printer_snapshot_${Date.now()}.jpg`,
+      );
+
+    const saved = await captureSnapshot(host, password, outputPath);
+    const stats = fs.statSync(saved);
+
+    return ok({
+      message: "Camera snapshot captured",
+      path: saved,
+      size_bytes: stats.size,
     });
   }
 
