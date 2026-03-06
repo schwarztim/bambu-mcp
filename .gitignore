@@ -30,8 +30,9 @@ npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
 
-# Ad-hoc test scripts
+# Ad-hoc test scripts (but not scripts/ directory)
 *.mjs
+!scripts/*.mjs
 
 # Package lock is committed for reproducible builds
 # package-lock.json

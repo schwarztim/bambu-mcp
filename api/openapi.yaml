@@ -1,0 +1,974 @@
+openapi: 3.0.3
+info:
+  title: Bambu Lab Cloud API
+  description: |
+    Reverse-engineered API specification for Bambu Lab cloud services.
+    Captured from Bambu Handy app (bbl.intl.bambulab.com) via live traffic interception.
+
+    ## Services
+    - **IoT Service** — Printer management, binding, certificates
+    - **User Service** — Messages, notifications, tasks
+    - **Design Service** — 3D models (MakerWorld), favorites, downloads
+    - **Comment Service** — Comments, ratings, messaging
+    - **Search Service** — Discovery, categories, trending
+    - **Operation Service** — App configuration
+    - And 8 more microservices
+
+    ## Authentication
+    All endpoints require Bearer JWT token from Bambu Lab account login.
+  version: 1.0.0-discovered
+  contact:
+    name: schwarztim
+    url: https://github.com/schwarztim/bambu-mcp
+servers:
+  - url: https://api.bambulab.com/v1
+    description: Production API
+  - url: https://makerworld.com/api/v1
+    description: MakerWorld (same API, Cloudflare-protected)
+security:
+  - bearerAuth: []
+tags:
+  - name: iot-service
+    description: Printer management, binding, certificates, slicer settings
+  - name: user-service
+    description: User messages, notifications, tasks, device tokens
+  - name: design-service
+    description: 3D model designs, favorites, downloads (MakerWorld)
+  - name: design-user-service
+    description: User profile, preferences, follows, permissions
+  - name: design-recommend-service
+    description: Personalized design recommendations
+  - name: comment-service
+    description: Comments, ratings, message sessions
+  - name: search-service
+    description: Design search, navigation, trending, related content
+  - name: operation-service
+    description: App configuration, homepage content
+  - name: aftersale-service
+    description: Support tickets, unread counts
+  - name: point-service
+    description: Points/rewards, design boosting
+  - name: report-service
+    description: Content reporting/moderation
+  - name: task-service
+    description: Onboarding tasks, achievements
+  - name: analysis-st
+    description: Analytics tags, user tracking
+paths:
+  /iot-service/api/user/bind:
+    get:
+      tags: [iot-service]
+      summary: List bound printers
+      description: Returns all printers bound to the authenticated user's account.
+      responses:
+        '200':
+          description: Array of printer objects
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    dev_id:
+                      type: string
+                      description: Printer serial number
+                    dev_model_name:
+                      type: string
+                    dev_product_name:
+                      type: string
+                    dev_access_code:
+                      type: string
+                    dev_connection_type:
+                      type: string
+  /iot-service/api/user/ttcode:
+    post:
+      tags: [iot-service]
+      summary: Generate TUTK connection code
+      description: Generate a ThroughTek P2P connection code for camera/LAN access.
+      responses:
+        '200':
+          description: TUTK connection code
+          content:
+            application/json:
+              schema:
+                type: object
+  /iot-service/api/user/profile/{userId}:
+    get:
+      tags: [iot-service]
+      summary: Get user printer profile
+      parameters:
+        - name: userId
+          in: path
+          required: true
+          schema:
+            type: string
+          example: '614790751'
+        - name: model_id
+          in: query
+          schema:
+            type: string
+          example: USf86740b8413939
+      responses:
+        '200':
+          description: User printer profile
+          content:
+            application/json:
+              schema:
+                type: object
+  /iot-service/api/user/task/{taskId}:
+    get:
+      tags: [iot-service]
+      summary: Get print task details
+      parameters:
+        - name: taskId
+          in: path
+          required: true
+          schema:
+            type: string
+          example: '788462557'
+      responses:
+        '200':
+          description: Print task details
+          content:
+            application/json:
+              schema:
+                type: object
+  /iot-service/api/user/applications/{appToken}/cert:
+    get:
+      tags: [iot-service]
+      summary: Exchange app token for X.509 certificate
+      description: |
+        Exchange an application token for an X.509 device certificate.
+        Used for MQTT authentication with printers post-January 2025 firmware.
+      parameters:
+        - name: appToken
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Base64url-encoded application token
+        - name: aes256
+          in: query
+          required: true
+          schema:
+            type: string
+          description: AES-256 encrypted payload
+      responses:
+        '200':
+          description: X.509 certificate and private key
+          content:
+            application/json:
+              schema:
+                type: object
+  /iot-service/api/slicer/setting:
+    get:
+      tags: [iot-service]
+      summary: Get slicer settings
+      parameters:
+        - name: version
+          in: query
+          schema:
+            type: string
+          example: 1.0.0.1
+        - name: public
+          in: query
+          schema:
+            type: boolean
+          example: false
+      responses:
+        '200':
+          description: Slicer configuration
+          content:
+            application/json:
+              schema:
+                type: object
+  /iot-service/api/slicer/resource:
+    get:
+      tags: [iot-service]
+      summary: Download slicer resources
+      parameters:
+        - name: slicer/info/bbl
+          in: query
+          schema:
+            type: string
+          example: 01.00.00.04
+        - name: slicer/settings/bbl
+          in: query
+          schema:
+            type: string
+          example: 02.05.00.02
+      responses:
+        '200':
+          description: Slicer resource bundle
+          content:
+            application/json:
+              schema:
+                type: object
+  /user-service/my/messages:
+    get:
+      tags: [user-service]
+      summary: Get messages by type
+      parameters:
+        - name: type
+          in: query
+          required: true
+          schema:
+            type: integer
+            enum: [1, 2, 3, 4, 5]
+          description: '1=system, 2=comments, 3=likes, 4=follows, 5=prints'
+        - name: offset
+          in: query
+          schema:
+            type: integer
+            default: 0
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            default: 20
+      responses:
+        '200':
+          description: Paginated messages
+          content:
+            application/json:
+              schema:
+                type: object
+  /user-service/my/message/count:
+    get:
+      tags: [user-service]
+      summary: Get unread message count
+      responses:
+        '200':
+          description: Unread counts by category
+          content:
+            application/json:
+              schema:
+                type: object
+  /user-service/my/message/latest:
+    get:
+      tags: [user-service]
+      summary: Get latest message
+      responses:
+        '200':
+          description: Most recent message
+          content:
+            application/json:
+              schema:
+                type: object
+  /user-service/my/message/read:
+    post:
+      tags: [user-service]
+      summary: Mark messages as read
+      responses:
+        '200':
+          description: Success
+  /user-service/my/message/device/taskstatus:
+    get:
+      tags: [user-service]
+      summary: Get device task notification status
+      responses:
+        '200':
+          description: Task status
+          content:
+            application/json:
+              schema:
+                type: object
+  /user-service/my/message/device/tasks/read:
+    post:
+      tags: [user-service]
+      summary: Mark device task notifications as read
+      responses:
+        '200':
+          description: Success
+  /user-service/my/task/{taskId}:
+    get:
+      tags: [user-service]
+      summary: Get print task by ID
+      parameters:
+        - name: taskId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Task details
+          content:
+            application/json:
+              schema:
+                type: object
+  /user-service/my/task/printedplates:
+    get:
+      tags: [user-service]
+      summary: Get printed plates for instance
+      parameters:
+        - name: instanceId
+          in: query
+          required: true
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: Printed plate info
+          content:
+            application/json:
+              schema:
+                type: object
+  /user-service/my/model/profile:
+    get:
+      tags: [user-service]
+      summary: Get model/printer profile
+      parameters:
+        - name: profileId
+          in: query
+          schema:
+            type: string
+        - name: modelId
+          in: query
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Model profile
+          content:
+            application/json:
+              schema:
+                type: object
+  /user-service/user/devicetoken:
+    post:
+      tags: [user-service]
+      summary: Register push notification token
+      description: Register FCM/APNs device token for push notifications.
+      responses:
+        '200':
+          description: Token registered
+  /user-service/latest/app:
+    get:
+      tags: [user-service]
+      summary: Check for app updates
+      responses:
+        '200':
+          description: Latest version info
+          content:
+            application/json:
+              schema:
+                type: object
+  /design-service/design/{designId}:
+    get:
+      tags: [design-service]
+      summary: Get design details
+      parameters:
+        - name: designId
+          in: path
+          required: true
+          schema:
+            type: integer
+          example: 2416782
+        - name: trafficSource
+          in: query
+          schema:
+            type: string
+            enum: [browse, recommend, search]
+        - name: visitHistory
+          in: query
+          schema:
+            type: boolean
+      responses:
+        '200':
+          description: Full design object
+          content:
+            application/json:
+              schema:
+                type: object
+  /design-service/design/{designId}/remixed:
+    get:
+      tags: [design-service]
+      summary: Get remixes of a design
+      parameters:
+        - name: designId
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: Remix list
+          content:
+            application/json:
+              schema:
+                type: object
+  /design-service/design/{designId}/like:
+    post:
+      tags: [design-service]
+      summary: Like/unlike a design
+      parameters:
+        - name: designId
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: Like toggled
+  /design-service/instance/{instanceId}/f3mf:
+    get:
+      tags: [design-service]
+      summary: Download 3MF file
+      parameters:
+        - name: instanceId
+          in: path
+          required: true
+          schema:
+            type: integer
+          example: 2650240
+        - name: type
+          in: query
+          required: true
+          schema:
+            type: string
+            enum: [preview, download]
+      responses:
+        '200':
+          description: 3MF file (binary for download, JSON for preview)
+  /design-service/favorites/designs/{userId}:
+    get:
+      tags: [design-service]
+      summary: Get user favorites
+      parameters:
+        - name: userId
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: offset
+          in: query
+          schema:
+            type: integer
+        - name: limit
+          in: query
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: Favorited designs
+          content:
+            application/json:
+              schema:
+                type: object
+  /design-service/my/design/favoriteslist:
+    get:
+      tags: [design-service]
+      summary: Check if design is favorited
+      parameters:
+        - name: designId
+          in: query
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: Favorites status
+          content:
+            application/json:
+              schema:
+                type: object
+  /design-service/my/design/like:
+    get:
+      tags: [design-service]
+      summary: Get liked designs
+      parameters:
+        - name: offset
+          in: query
+          schema:
+            type: integer
+        - name: limit
+          in: query
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: Liked designs
+          content:
+            application/json:
+              schema:
+                type: object
+  /design-service/my/favorites/listlite:
+    get:
+      tags: [design-service]
+      summary: Get favorite design IDs
+      description: Lightweight endpoint returning only IDs of favorited designs.
+      responses:
+        '200':
+          description: Array of design IDs
+          content:
+            application/json:
+              schema:
+                type: object
+  /design-service/draft/sliceerror:
+    get:
+      tags: [design-service]
+      summary: Get drafts with slice errors
+      responses:
+        '200':
+          description: Draft designs with slicing errors
+          content:
+            application/json:
+              schema:
+                type: object
+  /design-user-service/my/profile:
+    get:
+      tags: [design-user-service]
+      summary: Get MakerWorld profile
+      parameters:
+        - name: immediacy
+          in: query
+          schema:
+            type: boolean
+          description: true for non-cached response
+      responses:
+        '200':
+          description: User profile
+          content:
+            application/json:
+              schema:
+                type: object
+  /design-user-service/my/preference:
+    get:
+      tags: [design-user-service]
+      summary: Get user preferences
+      responses:
+        '200':
+          description: User preferences
+          content:
+            application/json:
+              schema:
+                type: object
+  /design-user-service/my/follow/mutual:
+    get:
+      tags: [design-user-service]
+      summary: Get mutual follows
+      responses:
+        '200':
+          description: Mutual follow list
+          content:
+            application/json:
+              schema:
+                type: object
+  /design-user-service/my/permission:
+    get:
+      tags: [design-user-service]
+      summary: Check user permissions
+      parameters:
+        - name: permType
+          in: query
+          required: true
+          schema:
+            type: integer
+            enum: [0, 6]
+          description: '0=general, 6=upload'
+      responses:
+        '200':
+          description: Permission status
+          content:
+            application/json:
+              schema:
+                type: object
+  /design-recommend-service/my/for-you:
+    get:
+      tags: [design-recommend-service]
+      summary: Get personalized recommendations
+      parameters:
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            default: 20
+        - name: offset
+          in: query
+          schema:
+            type: integer
+            default: 0
+        - name: seed
+          in: query
+          schema:
+            type: integer
+          description: Randomization seed (0 for fresh)
+        - name: acceptTypes
+          in: query
+          schema:
+            type: string
+          description: 'Comma-separated: 0=model, 2=remix, 3=article, 5=collection, 6=tutorial'
+          example: '0,2,5,6,3'
+      responses:
+        '200':
+          description: Recommended designs
+          content:
+            application/json:
+              schema:
+                type: object
+  /comment-service/commentandrating:
+    get:
+      tags: [comment-service]
+      summary: Get comments and ratings for design
+      parameters:
+        - name: designId
+          in: query
+          required: true
+          schema:
+            type: integer
+        - name: offset
+          in: query
+          schema:
+            type: integer
+            default: 0
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            default: 20
+        - name: type
+          in: query
+          schema:
+            type: integer
+            default: 0
+          description: '0=all'
+        - name: sort
+          in: query
+          schema:
+            type: integer
+            default: 0
+          description: '0=newest'
+      responses:
+        '200':
+          description: Comments and ratings
+          content:
+            application/json:
+              schema:
+                type: object
+  /comment-service/comment/{commentId}/detail:
+    get:
+      tags: [comment-service]
+      summary: Get comment details
+      parameters:
+        - name: commentId
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: Comment details
+          content:
+            application/json:
+              schema:
+                type: object
+  /comment-service/comment/{commentId}/reply:
+    get:
+      tags: [comment-service]
+      summary: Get replies to comment
+      parameters:
+        - name: commentId
+          in: path
+          required: true
+          schema:
+            type: integer
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            default: 10
+        - name: after
+          in: query
+          schema:
+            type: integer
+          description: Reply ID cursor for pagination
+        - name: msgCommentReplyId
+          in: query
+          schema:
+            type: integer
+          description: Load context around specific reply
+      responses:
+        '200':
+          description: Reply list
+          content:
+            application/json:
+              schema:
+                type: object
+    post:
+      tags: [comment-service]
+      summary: Reply to a comment
+      parameters:
+        - name: commentId
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: Reply created
+  /comment-service/comment/{commentId}/like:
+    post:
+      tags: [comment-service]
+      summary: Like a comment
+      parameters:
+        - name: commentId
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: Like toggled
+  /comment-service/rating/inst/{instanceId}:
+    get:
+      tags: [comment-service]
+      summary: Get instance rating
+      parameters:
+        - name: instanceId
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: Rating data
+          content:
+            application/json:
+              schema:
+                type: object
+  /comment-service/messagesession/list:
+    get:
+      tags: [comment-service]
+      summary: Get message sessions
+      parameters:
+        - name: userSelect
+          in: query
+          schema:
+            type: string
+            default: all
+        - name: typeSelect
+          in: query
+          schema:
+            type: string
+            default: all
+        - name: projectScope
+          in: query
+          schema:
+            type: integer
+          description: '0=general, 2=MakerWorld'
+        - name: offset
+          in: query
+          schema:
+            type: integer
+        - name: limit
+          in: query
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: Message sessions
+          content:
+            application/json:
+              schema:
+                type: object
+  /search-service/homepage/nav:
+    get:
+      tags: [search-service]
+      summary: Get homepage navigation
+      responses:
+        '200':
+          description: Navigation structure
+          content:
+            application/json:
+              schema:
+                type: object
+  /search-service/recommand/youlike:
+    get:
+      tags: [search-service]
+      summary: Get recommended designs
+      description: Note - API has typo 'recommand' instead of 'recommend'
+      responses:
+        '200':
+          description: Recommended designs
+          content:
+            application/json:
+              schema:
+                type: object
+  /search-service/select/design/nav:
+    get:
+      tags: [search-service]
+      summary: Browse designs by category
+      parameters:
+        - name: navKey
+          in: query
+          required: true
+          schema:
+            type: string
+          description: 'Category: Trending, category_400 (Toys), category_800 (Home)'
+          example: Trending
+        - name: offset
+          in: query
+          schema:
+            type: integer
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            default: 20
+      responses:
+        '200':
+          description: Designs in category
+          content:
+            application/json:
+              schema:
+                type: object
+  /search-service/design/{designId}/relate:
+    get:
+      tags: [search-service]
+      summary: Get related designs
+      parameters:
+        - name: designId
+          in: path
+          required: true
+          schema:
+            type: integer
+        - name: offset
+          in: query
+          schema:
+            type: integer
+        - name: limit
+          in: query
+          schema:
+            type: integer
+        - name: scene
+          in: query
+          schema:
+            type: integer
+          description: '1=similar'
+      responses:
+        '200':
+          description: Related designs
+          content:
+            application/json:
+              schema:
+                type: object
+  /operation-service/apphomepage:
+    get:
+      tags: [operation-service]
+      summary: Get app homepage config
+      responses:
+        '200':
+          description: Homepage configuration
+          content:
+            application/json:
+              schema:
+                type: object
+  /operation-service/configuration:
+    get:
+      tags: [operation-service]
+      summary: Get app configuration
+      description: Feature flags, URLs, and global settings.
+      responses:
+        '200':
+          description: App configuration
+          content:
+            application/json:
+              schema:
+                type: object
+  /aftersale-service/trouble/totalunreadcount:
+    get:
+      tags: [aftersale-service]
+      summary: Get unread trouble ticket count
+      responses:
+        '200':
+          description: Unread count
+          content:
+            application/json:
+              schema:
+                type: object
+  /aftersale-service/makerworld/totalunreadcount:
+    get:
+      tags: [aftersale-service]
+      summary: Get unread MakerWorld support count
+      responses:
+        '200':
+          description: Unread count
+          content:
+            application/json:
+              schema:
+                type: object
+  /point-service/boost/boostdesign:
+    get:
+      tags: [point-service]
+      summary: Get design boost status
+      parameters:
+        - name: designId
+          in: query
+          required: true
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: Boost status
+          content:
+            application/json:
+              schema:
+                type: object
+  /report-service/report/classification:
+    get:
+      tags: [report-service]
+      summary: Get report classifications
+      parameters:
+        - name: source
+          in: query
+          schema:
+            type: string
+          example: message
+      responses:
+        '200':
+          description: Classification options
+          content:
+            application/json:
+              schema:
+                type: object
+  /task-service/user/taskv2/multi:
+    get:
+      tags: [task-service]
+      summary: Get onboarding task status
+      parameters:
+        - name: taskNames
+          in: query
+          schema:
+            type: string
+          example: app_newbie_task_v2,app_newbie_task_v3
+      responses:
+        '200':
+          description: Task statuses
+          content:
+            application/json:
+              schema:
+                type: object
+  /analysis-st/tag/:
+    get:
+      tags: [analysis-st]
+      summary: Get analytics tags
+      parameters:
+        - name: UID
+          in: query
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Analytics tags
+          content:
+            application/json:
+              schema:
+                type: object
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: JWT token from Bambu Lab account login

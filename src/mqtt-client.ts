@@ -5,6 +5,7 @@
  */
 
 import * as mqtt from "mqtt";
+import * as crypto from "crypto";
 
 export interface MQTTConfig {
   host: string;
@@ -13,6 +14,12 @@ export interface MQTTConfig {
   password: string;
   deviceId: string;
   useTLS?: boolean;
+  /** RSA private key (PEM) for signing MQTT commands (post-Jan 2025 firmware) */
+  privateKey?: string;
+  /** X.509 cert_id for the signature header */
+  certId?: string;
+  /** Bambu Lab user ID (numeric string) included in signed payloads */
+  userId?: string;
 }
 
 export interface PrinterStatus {
@@ -238,7 +245,7 @@ export class BambuMQTTClient {
       const topic = `device/${this.config.deviceId}/request`;
       const [type, cmd] = command.split(".");
 
-      const message = {
+      const message: any = {
         [type]: {
           sequence_id: sequenceId,
           command: cmd,
@@ -246,8 +253,11 @@ export class BambuMQTTClient {
         },
       };
 
+      // Sign the message if credentials are available (post-Jan 2025 firmware)
+      const signed = this.signMessage(message);
+
       if (!waitForResponse) {
-        this.client.publish(topic, JSON.stringify(message), (err) => {
+        this.client.publish(topic, JSON.stringify(signed), (err) => {
           if (err) reject(err);
           else resolve({ sent: true, command });
         });
@@ -271,7 +281,7 @@ export class BambuMQTTClient {
 
       this.client.on("message", responseHandler);
 
-      this.client.publish(topic, JSON.stringify(message), (err) => {
+      this.client.publish(topic, JSON.stringify(signed), (err) => {
         if (err) {
           this.client!.removeListener("message", responseHandler);
           reject(err);
@@ -283,6 +293,39 @@ export class BambuMQTTClient {
         reject(new Error(`Command '${command}' timed out after 10s`));
       }, 10000);
     });
+  }
+
+  /**
+   * Sign an MQTT message with RSA-SHA256 per post-Jan 2025 firmware requirements.
+   * If no private key is configured, returns the message unsigned (legacy mode).
+   */
+  private signMessage(message: any): any {
+    if (!this.config.privateKey || !this.config.certId) {
+      return message;
+    }
+
+    // Add user_id at the top level if available (observed in captured traffic)
+    const payload: any = { ...message };
+    if (this.config.userId) {
+      payload.user_id = this.config.userId;
+    }
+
+    // Sign everything except the header
+    const payloadStr = JSON.stringify(payload);
+    const signature = crypto
+      .sign("RSA-SHA256", Buffer.from(payloadStr), this.config.privateKey)
+      .toString("base64");
+
+    return {
+      ...payload,
+      header: {
+        sign_ver: "v1.0",
+        sign_alg: "RSA_SHA256",
+        sign_string: signature,
+        cert_id: this.config.certId,
+        payload_len: new TextEncoder().encode(payloadStr).length,
+      },
+    };
   }
 
   // === Status ===

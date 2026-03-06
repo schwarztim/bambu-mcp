@@ -27,7 +27,7 @@ import {
   ListResourcesRequestSchema,
   ReadResourceRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
-import type { BambuLabConfig } from "./types.js";
+import { getAppCert, type BambuLabConfig } from "./types.js";
 import { BambuMQTTClient, type MQTTConfig } from "./mqtt-client.js";
 import type { PrintMonitor } from "./print-monitor.js";
 import type { ToolContext } from "./tool-context.js";
@@ -36,6 +36,9 @@ import { initRedaction, registerSensitiveValue } from "./redact.js";
 import { addConfirmParam, checkConfirmation } from "./write-protection.js";
 import { getResources, readResource } from "./resources.js";
 import { getSecret } from "./secrets.js";
+import * as fs from "fs";
+import * as path from "path";
+import * as os from "os";
 
 // Tool modules
 import cloudApiModule from "./tools/cloud-api.js";
@@ -53,22 +56,52 @@ import slicerModule from "./tools/slicer.js";
 // Initialize redaction with known sensitive env vars
 initRedaction();
 
-// Configuration (with encrypted secrets fallback)
+// Credentials file (auto-populated by `npm run setup`)
+interface SavedCredentials {
+  accessToken?: string;
+  userId?: string;
+  printer?: { deviceId?: string; accessCode?: string; host?: string };
+}
+
+function loadCredentialsFile(): SavedCredentials {
+  try {
+    const credsPath = path.join(os.homedir(), ".bambu-mcp", "credentials.json");
+    if (fs.existsSync(credsPath)) {
+      const creds = JSON.parse(fs.readFileSync(credsPath, "utf-8"));
+      console.error("[bambu-mcp] Loaded credentials from", credsPath);
+      return creds;
+    }
+  } catch (e: any) {
+    console.error("[bambu-mcp] Failed to load credentials file:", e.message);
+  }
+  return {};
+}
+
+const savedCreds = loadCredentialsFile();
+
+// Configuration (env vars > encrypted secrets > credentials file)
 const BASE_URL =
-  getSecret("BAMBU_LAB_BASE_URL") || "https://bambulab.com/api/v1";
+  getSecret("BAMBU_LAB_BASE_URL") || "https://api.bambulab.com/v1";
 const AUTH_COOKIES = getSecret("BAMBU_LAB_COOKIES") || "";
+const ACCESS_TOKEN =
+  getSecret("BAMBU_LAB_ACCESS_TOKEN") || savedCreds.accessToken || "";
 const APP_CERT_ID =
   getSecret("BAMBU_LAB_APP_CERT_ID") ||
   "GLOF3813734089-524a37c80000c6a6a274a47b3281";
 
-const MQTT_HOST = getSecret("BAMBU_LAB_MQTT_HOST") || "";
+const MQTT_HOST =
+  getSecret("BAMBU_LAB_MQTT_HOST") || savedCreds.printer?.host || "";
 const MQTT_PORT = parseInt(getSecret("BAMBU_LAB_MQTT_PORT") || "8883");
 const MQTT_USERNAME = getSecret("BAMBU_LAB_MQTT_USERNAME") || "bblp";
-const MQTT_PASSWORD = getSecret("BAMBU_LAB_MQTT_PASSWORD") || "";
-const MQTT_DEVICE_ID = getSecret("BAMBU_LAB_DEVICE_ID") || "";
+const MQTT_PASSWORD =
+  getSecret("BAMBU_LAB_MQTT_PASSWORD") || savedCreds.printer?.accessCode || "";
+const MQTT_DEVICE_ID =
+  getSecret("BAMBU_LAB_DEVICE_ID") || savedCreds.printer?.deviceId || "";
+const USER_ID = getSecret("BAMBU_LAB_USER_ID") || savedCreds.userId || "";
 
 // Register dynamically-loaded secrets for redaction
 if (AUTH_COOKIES) registerSensitiveValue(AUTH_COOKIES);
+if (ACCESS_TOKEN) registerSensitiveValue(ACCESS_TOKEN);
 if (MQTT_PASSWORD) registerSensitiveValue(MQTT_PASSWORD);
 if (MQTT_HOST) registerSensitiveValue(MQTT_HOST);
 if (MQTT_DEVICE_ID) registerSensitiveValue(MQTT_DEVICE_ID);
@@ -143,17 +176,25 @@ class BambuLabMCP {
   private async initMQTT() {
     if (MQTT_HOST && MQTT_PASSWORD && MQTT_DEVICE_ID) {
       try {
+        const appCert = getAppCert();
         const config: MQTTConfig = {
           host: MQTT_HOST,
           port: MQTT_PORT,
           username: MQTT_USERNAME,
           password: MQTT_PASSWORD,
           deviceId: MQTT_DEVICE_ID,
+          privateKey: appCert.privateKey,
+          certId: APP_CERT_ID,
+          userId: USER_ID || undefined,
         };
 
         this.mqttClient = new BambuMQTTClient(config);
         await this.mqttClient.connect();
-        console.error("[bambu-mcp] MQTT connected to", MQTT_HOST);
+        console.error(
+          "[bambu-mcp] MQTT connected to",
+          MQTT_HOST,
+          "(commands signed)",
+        );
       } catch (error: any) {
         console.error("[bambu-mcp] MQTT connection failed:", error.message);
       }

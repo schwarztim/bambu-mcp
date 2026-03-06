@@ -5,6 +5,7 @@ import { ok } from "../tool-context.js";
 import fetch from "node-fetch";
 import * as crypto from "crypto";
 import { getAppCert } from "../types.js";
+import { getSecret } from "../secrets.js";
 
 export const tools: Tool[] = [
   {
@@ -48,21 +49,27 @@ async function makeRequest(
   endpoint: string,
   options: any = {},
 ) {
-  if (!ctx.config.cookies) {
+  const accessToken = getSecret("BAMBU_LAB_ACCESS_TOKEN") || "";
+  if (!accessToken && !ctx.config.cookies) {
     throw new Error(
-      "Cloud API requires BAMBU_LAB_COOKIES environment variable.",
+      "Cloud API requires authentication. Run `npm run setup` or set BAMBU_LAB_ACCESS_TOKEN.",
     );
   }
 
   const url = `${ctx.config.baseUrl}${endpoint}`;
-  const headers = {
-    Cookie: ctx.config.cookies,
+  const headers: Record<string, string> = {
     "Content-Type": "application/json",
     "x-bbl-client-type": "web",
     "x-bbl-client-name": "Portal",
     "x-bbl-client-version": "00.00.00.01",
     ...options.headers,
   };
+
+  if (accessToken) {
+    headers["Authorization"] = `Bearer ${accessToken}`;
+  } else if (ctx.config.cookies) {
+    headers["Cookie"] = ctx.config.cookies;
+  }
 
   const response = await fetch(url, { ...options, headers });
 

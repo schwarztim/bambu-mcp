@@ -3,6 +3,7 @@ import type { ToolModule } from "./tool-module.js";
 import type { ToolContext } from "../tool-context.js";
 import { ok } from "../tool-context.js";
 import { BambuMQTTClient, type MQTTConfig } from "../mqtt-client.js";
+import { getAppCert } from "../types.js";
 
 export const tools: Tool[] = [
   {
@@ -51,12 +52,16 @@ export function createHandlers(
       password: string;
       device_id: string;
     }) => {
+      const appCert = getAppCert();
       const config: MQTTConfig = {
         host: args.host,
         port: args.port || 8883,
         username: args.username || "bblp",
         password: args.password,
         deviceId: args.device_id,
+        privateKey: appCert.privateKey,
+        certId: ctx.config.appCertId,
+        userId: ctx.getEnv("BAMBU_LAB_USER_ID") || undefined,
       };
 
       const client = new BambuMQTTClient(config);
@@ -64,7 +69,7 @@ export function createHandlers(
       ctx.setMqttClient(client);
 
       return ok({
-        message: "Connected to printer via MQTT",
+        message: "Connected to printer via MQTT (commands signed)",
         host: args.host,
         device_id: args.device_id,
       });
