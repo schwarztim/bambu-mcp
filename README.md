@@ -255,6 +255,37 @@ The certificate can be overridden via `BAMBU_APP_PRIVATE_KEY` and `BAMBU_APP_CER
 2. Rotate LAN access codes periodically
 3. Never commit `.env` files (already in `.gitignore`)
 
+## AI Skill
+
+The `skill/` directory contains a `SKILL.md` that teaches AI assistants (Claude Code, OpenClaw) how to use this MCP server — safety rules, tool reference, workflows, and troubleshooting.
+
+### Install locally
+
+```bash
+# Both Claude Code and OpenClaw
+./install-skill.sh
+
+# Claude Code only
+./install-skill.sh claude
+
+# OpenClaw only
+./install-skill.sh openclaw
+```
+
+This symlinks `skill/` into `~/.claude/skills/bambu` and/or `~/.openclaw/skills/bambu`.
+
+### Publish to ClawHub
+
+To make the skill available to all OpenClaw users via [ClawHub](https://clawhub.ai):
+
+```bash
+npm i -g clawhub
+clawhub login
+clawhub publish ./skill --slug bambu --name "Bambu Lab 3D Printer" --version 1.0.0 --changelog "Initial release"
+```
+
+Users can then install it with `clawhub install bambu`.
+
 ## Acknowledgments
 
 - **Community researchers** who [extracted the X.509 certificate](https://hackaday.com/2025/01/19/bambu-connects-authentication-x-509-certificate-and-private-key-extracted/) — making this possible
