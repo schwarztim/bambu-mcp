@@ -55,8 +55,7 @@ Community researchers extracted the X.509 certificate and private key from the B
 
 - Node.js 18+
 - Bambu Lab printer on your local network
-- Printer LAN access code (printer screen -> WLAN -> Access Code)
-- Printer serial number (Settings -> Device -> Serial Number)
+- **Developer Mode enabled** on the printer (recommended — Settings > LAN Only > Developer Mode)
 
 ### Install
 
@@ -67,14 +66,16 @@ npm install
 npm run build
 ```
 
-### Configure
+### Option A: Developer Mode (Recommended)
+
+Enable Developer Mode on your printer, then configure with your LAN credentials:
 
 ```bash
-cp .env.example .env
-# Edit .env with your printer IP, access code, and serial number
+# Grab these from your printer screen:
+#   IP Address:    WLAN → IP
+#   Access Code:   WLAN → Access Code (8-digit)
+#   Serial Number: Settings → Device → Serial Number
 ```
-
-### Register with Claude Code
 
 Add to `~/.claude/user-mcps.json`:
 
@@ -93,6 +94,35 @@ Add to `~/.claude/user-mcps.json`:
   }
 }
 ```
+
+Developer Mode gives the most reliable experience. All MQTT commands are automatically signed with X.509 certificates.
+
+### Option B: Browser Login (No Developer Mode)
+
+If you don't want to enable Developer Mode (e.g., to keep Bambu Handy working), you can authenticate via browser login instead:
+
+```bash
+npm run setup
+```
+
+This opens Firefox (used instead of Chrome to avoid Google SSO bot detection), lets you log into your Bambu Lab account, and auto-discovers your printers. Credentials are saved to `~/.bambu-mcp/credentials.json` and loaded automatically — no env vars needed.
+
+> **Note:** Token is valid for ~3 months. Run `npm run setup` again to refresh.
+
+Then register with Claude Code (no env vars required):
+
+```json
+{
+  "mcpServers": {
+    "bambu-lab": {
+      "command": "node",
+      "args": ["/path/to/bambu-mcp/dist/index.js"]
+    }
+  }
+}
+```
+
+> **Limitations without Developer Mode:** Printing `.3mf` files via `project_file` command requires Developer Mode. `.gcode` files and all other commands (stop, pause, resume, status, speed, G-code, camera, AMS) work without it.
 
 ## Tools
 
