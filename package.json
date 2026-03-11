@@ -31,7 +31,7 @@
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.26.0",
-    "basic-ftp": "^5.1.0",
+    "basic-ftp": "^5.2.0",
     "mqtt": "^5.11.1",
     "node-fetch": "^3.3.2"
   },
