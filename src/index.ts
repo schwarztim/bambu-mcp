@@ -98,6 +98,33 @@ const MQTT_PASSWORD =
 const MQTT_DEVICE_ID =
   getSecret("BAMBU_LAB_DEVICE_ID") || savedCreds.printer?.deviceId || "";
 const USER_ID = getSecret("BAMBU_LAB_USER_ID") || savedCreds.userId || "";
+// Disconnect MQTT after this many seconds without a printer tool call (0 = never)
+const MQTT_IDLE_MS =
+  parseInt(getSecret("BAMBU_LAB_MQTT_IDLE_SECONDS") || "300") * 1000;
+
+// Tools that talk to the printer over MQTT; they connect on demand
+const MQTT_TOOLS = new Set([
+  "printer_get_status",
+  "printer_get_cached_status",
+  "printer_get_version",
+  "printer_stop",
+  "printer_pause",
+  "printer_resume",
+  "printer_set_speed",
+  "printer_send_gcode",
+  "printer_print_file",
+  "skip_objects",
+  "ams_change_filament",
+  "ams_unload_filament",
+  "ams_filament_mapping",
+  "camera_record",
+  "camera_timelapse",
+  "led_control",
+  "set_nozzle",
+  "set_temperature",
+  "monitor_start",
+  "makerworld_print",
+]);
 
 // Register dynamically-loaded secrets for redaction
 if (AUTH_COOKIES) registerSensitiveValue(AUTH_COOKIES);
@@ -148,7 +175,9 @@ class BambuLabMCP {
     }
 
     this.setupHandlers();
-    this.initMQTT();
+    // MQTT connects lazily on the first printer tool call (see ensureMQTT):
+    // the printer accepts only a few MQTT clients, and every Claude session
+    // starts its own server, so an eager connection locks out Bambu Studio.
   }
 
   private createContext(): ToolContext {
@@ -173,9 +202,20 @@ class BambuLabMCP {
     };
   }
 
-  private async initMQTT() {
-    if (MQTT_HOST && MQTT_PASSWORD && MQTT_DEVICE_ID) {
-      try {
+  private mqttConnecting: Promise<void> | null = null;
+  private idleTimer: NodeJS.Timeout | null = null;
+
+  /** Connect to the configured printer if not connected yet. */
+  private async ensureMQTT(): Promise<void> {
+    if (this.mqttClient?.isConnected()) return;
+    if (!(MQTT_HOST && MQTT_PASSWORD && MQTT_DEVICE_ID)) return;
+    if (!this.mqttConnecting) {
+      // A dropped client keeps auto-reconnecting; end it before starting fresh
+      if (this.mqttClient) {
+        this.mqttClient.disconnect();
+        this.mqttClient = null;
+      }
+      this.mqttConnecting = (async () => {
         const appCert = getAppCert();
         const config: MQTTConfig = {
           host: MQTT_HOST,
@@ -187,22 +227,37 @@ class BambuLabMCP {
           certId: APP_CERT_ID,
           userId: USER_ID || undefined,
         };
-
-        this.mqttClient = new BambuMQTTClient(config);
-        await this.mqttClient.connect();
-        console.error(
-          "[bambu-mcp] MQTT connected to",
-          MQTT_HOST,
-          "(commands signed)",
-        );
-      } catch (error: any) {
-        console.error("[bambu-mcp] MQTT connection failed:", error.message);
-      }
-    } else {
-      console.error(
-        "[bambu-mcp] MQTT not configured — set BAMBU_LAB_MQTT_HOST, BAMBU_LAB_MQTT_PASSWORD, BAMBU_LAB_DEVICE_ID",
-      );
+        const client = new BambuMQTTClient(config);
+        await client.connect();
+        this.mqttClient = client;
+        console.error("[bambu-mcp] MQTT connected on demand (commands signed)");
+        // Fill the status cache so cached-status tools have data at once
+        try {
+          await client.requestStatus();
+        } catch {}
+      })().finally(() => {
+        this.mqttConnecting = null;
+      });
     }
+    await this.mqttConnecting;
+  }
+
+  /** Drop the MQTT connection after a quiet period so other clients get in. */
+  private scheduleIdleDisconnect() {
+    if (this.idleTimer) clearTimeout(this.idleTimer);
+    if (MQTT_IDLE_MS <= 0) return;
+    this.idleTimer = setTimeout(() => {
+      this.idleTimer = null;
+      if (!this.mqttClient) return;
+      if (this.printMonitor?.getState().active) {
+        this.scheduleIdleDisconnect();
+        return;
+      }
+      console.error("[bambu-mcp] MQTT idle, disconnecting");
+      this.mqttClient.disconnect();
+      this.mqttClient = null;
+    }, MQTT_IDLE_MS);
+    this.idleTimer.unref();
   }
 
   private setupHandlers() {
@@ -226,10 +281,21 @@ class BambuLabMCP {
         if (!handler) {
           return err(`Unknown tool: ${name}`);
         }
+        if (MQTT_TOOLS.has(name)) {
+          try {
+            await this.ensureMQTT();
+          } catch (error: any) {
+            return err(`MQTT connection failed: ${error.message}`);
+          }
+        }
         return await handler(args as any);
       } catch (error: any) {
         console.error(`[bambu-mcp] Tool ${name} failed:`, error.message);
         return err(error.message);
+      } finally {
+        if (MQTT_TOOLS.has(name) || name === "mqtt_connect") {
+          this.scheduleIdleDisconnect();
+        }
       }
     });
 
@@ -269,7 +335,7 @@ class BambuLabMCP {
     );
     console.error(
       "MQTT:",
-      this.mqttClient?.isConnected() ? "connected" : "not connected",
+      MQTT_HOST ? "on demand (idle disconnect)" : "not configured",
     );
     console.error("=".repeat(50));
   }
